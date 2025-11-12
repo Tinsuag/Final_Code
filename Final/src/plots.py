@@ -46,3 +46,10 @@ class PlotApp:
             self.canvas.draw()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load or plot data: {e}")
+            
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = PlotApp(root)
+    root.mainloop()

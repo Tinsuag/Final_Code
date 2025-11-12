@@ -1,0 +1,10 @@
+{
+    "cmake.sourceDirectory": "C:/Users/Tinsae Tesfamichael/Desktop/Thesis/[_Final_code]/Final/lib/Adafruit BusIO",
+    "python-envs.pythonProjects": [
+        {
+            "path": "",
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
+}

@@ -1,0 +1,317 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg") # 
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+class GaitGraphsApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Gait Graphs (Phase & Time)")
+        self.geometry("1200x800")
+
+        # ====== Demo Data (swap with your real arrays) ======
+        # Phase domain (0..1)
+        self.Np = 600
+        self.phase = np.linspace(0, 1, self.Np)
+        # Map phase to radians for sin/cos waveforms (typical NN phase parametrization)
+        phi = 2 * np.pi * self.phase
+        self.sin_phase = np.sin(phi)
+        self.cos_phase = np.cos(phi)
+
+        # Angles vs phase (theta, alpha) — demo shapes
+        self.theta_phase = 0.6*np.sin(phi + 0.3)            # rad
+        self.alpha_phase = 0.4*np.sin(phi - 0.7) + 0.2      # rad
+
+        # Torque & accel vs phase — demo; scale to typical magnitudes
+        self.torque_phase = 25*np.maximum(0, np.sin(phi) )  # Nm (example)
+        self.accel_phase  = 3*np.cos(2*phi)                 # m/s^2 (example)
+
+        # Time domain
+        self.Nt = 800
+        self.t = np.linspace(0, 10, self.Nt)  # seconds
+
+        # Stride/phase over time (phase wraps)
+        # Example: phase increases roughly linearly and wraps mod 1
+        base_rate = 0.9 / self.t[-1]          # ~0.09 per second
+        phase_unwrapped = base_rate*self.t + 0.08*np.sin(0.8*self.t)
+        self.phase_t = np.mod(phase_unwrapped, 1.0)
+        self.phase_rate = np.gradient(self.phase_t, self.t) # per second
+
+        # Angles vs time (reuse shapes but in time)
+        self.theta_t = 0.6*np.sin(2*np.pi*self.phase_t + 0.3)
+        self.alpha_t = 0.4*np.sin(2*np.pi*self.phase_t - 0.7) + 0.2
+
+        # Desired torque vs time (example)
+        self.desired_torque_t = 20*np.maximum(0, np.sin(2*np.pi*self.phase_t+0.2))
+
+        # Indicator vs time (binary-ish signal; e.g., stance=1 swing=0)
+        self.indicator_t = (self.cos_phase_like(self.t) > 0).astype(float)
+
+        # Heel positions vs time (forward & upward)
+        self.forward_heel = 0.5*np.sin(2*np.pi*self.phase_t) + 0.55
+        self.upward_heel  = 0.08*np.maximum(0, np.sin(2*np.pi*self.phase_t+0.3))
+
+        # Foot & shank angles vs time
+        self.foot_angle  = 0.25*np.sin(2*np.pi*self.phase_t + 0.1)
+        self.shank_angle = 0.35*np.sin(2*np.pi*self.phase_t - 0.4)
+
+        # ====== UI LAYOUT ======
+        self.make_controls()
+        self.make_notebook_and_graphs()
+        self.draw_all()
+
+    # Simple helper to get a cos-like function over time for a demo indicator
+    def cos_phase_like(self, t):
+        return np.cos(2*np.pi*self.phase_t)
+
+    # ---------- Controls ----------
+    def make_controls(self):
+        ctrl = ttk.Frame(self, padding=8)
+        ctrl.pack(side=tk.TOP, fill=tk.X)
+
+        # Phase marker (Graph 1)
+        ttk.Label(ctrl, text="Phase marker (0–1) → Graph 1:").pack(side=tk.LEFT, padx=(0,6))
+        self.phase_marker_var = tk.StringVar(value="0.25")
+        ttk.Entry(ctrl, textvariable=self.phase_marker_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text="Set Phase Marker", command=self.set_phase_marker).pack(side=tk.LEFT, padx=6)
+        ttk.Spinbox(ctrl, background= "black",cursor= "")
+        
+        # Time marker (Graphs 2 & 3)
+        ttk.Label(ctrl, text="Time marker (sec) → Graphs 2 & 3:").pack(side=tk.LEFT, padx=(20,6))
+        self.time_marker_var = tk.StringVar(value="3.0")
+        ttk.Entry(ctrl, textvariable=self.time_marker_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text="Set Time Marker", command=self.set_time_marker).pack(side=tk.LEFT, padx=6)
+
+        # Export
+        ttk.Button(ctrl, text="Export All PNGs…", command=self.export_pngs).pack(side=tk.RIGHT)
+
+    # ---------- Notebook + Graphs ----------
+    def make_notebook_and_graphs(self):
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Graph 1 (Phase)
+        self.tab1 = ttk.Frame(self.nb)
+        self.nb.add(self.tab1, text="Graph 1: vs Phase")
+
+        self.fig1 = Figure(figsize=(5,5), dpi=100, frameon=False)  # Create figure for Graph 1 size is adjustable by changing figsize in Figure() by user
+        self.ax1 = self.fig1.add_subplot(111)
+        self.canvas1 = FigureCanvasTkAgg(self.fig1, master=self.tab1) # Create canvas for Graph 1 by user first argument is figure object while second is master widget
+        self.canvas1.draw() # Draw the canvas for Graph 1 
+        self.canvas1.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True) # Pack the canvas widget for Graph 1
+        self.toolbar1 = NavigationToolbar2Tk(self.canvas1, self.tab1, pack_toolbar=False) # Create toolbar for Graph 1
+        self.toolbar1.update()
+        self.toolbar1.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Graph 2 (Time)
+        self.tab2 = ttk.Frame(self.nb)
+        self.nb.add(self.tab2, text="Graph 2: vs Time")
+
+        self.fig2 = Figure(figsize=(5,4), dpi=100)
+        self.ax2 = self.fig2.add_subplot(111)
+        self.canvas2 = FigureCanvasTkAgg(self.fig2, master=self.tab2)
+        self.canvas2.draw()
+        self.canvas2.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.toolbar2 = NavigationToolbar2Tk(self.canvas2, self.tab2, pack_toolbar=False)
+        self.toolbar2.update() # Update the toolbar for Graph 2
+        self.toolbar2.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Graph 3 (Time)
+        self.tab3 = ttk.Frame(self.nb)
+        self.nb.add(self.tab3, text="Graph 3: Heel & Angles vs Time")
+
+        self.fig3 = Figure(figsize=(5,4), dpi=100)
+        self.ax3 = self.fig3.add_subplot(111)
+        self.canvas3 = FigureCanvasTkAgg(self.fig3, master=self.tab3)
+        self.canvas3.draw()
+        self.canvas3.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.toolbar3 = NavigationToolbar2Tk(self.canvas3, self.tab3, pack_toolbar=False)
+        self.toolbar3.update()
+        self.toolbar3.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Marker graphics (init as None)
+        self.phase_vline = None
+        self.phase_markers = []  # scatter points on graph 1
+
+        self.time_vline_g2 = None
+        self.time_markers_g2 = []
+
+        self.time_vline_g3 = None
+        self.time_markers_g3 = []
+
+    # ---------- Plotting ----------
+    def draw_all(self):
+        self.draw_graph1()
+        self.draw_graph2()
+        self.draw_graph3()
+
+    def draw_graph1(self):
+        self.ax1.clear() # Clear previous plots
+        # Left axis: sin/cos + angles
+        l1, = self.ax1.plot(self.phase, self.sin_phase, label="sin(phase)")
+        l2, = self.ax1.plot(self.phase, self.cos_phase, label="cos(phase)")
+        l3, = self.ax1.plot(self.phase, self.theta_phase, label="theta (rad)")
+        l4, = self.ax1.plot(self.phase, self.alpha_phase, label="alpha (rad)")
+
+        # Right axis: torque & acceleration (different units)
+        ax1r = self.ax1.twinx()
+        r1, = ax1r.plot(self.phase, self.torque_phase, linestyle='--', label="torque (Nm)")
+        r2, = ax1r.plot(self.phase, self.accel_phase,  linestyle='-.', label="accel (m/s²)")
+
+        self.ax1.set_xlabel("Gait phase (0 → 1)")
+        self.ax1.set_ylabel("Unitless / Angles (rad)")
+        ax1r.set_ylabel("Torque / Accel")
+
+        # Build a combined legend
+        lines = [l1, l2, l3, l4, r1, r2]
+        labels = [ln.get_label() for ln in lines]
+        self.ax1.legend(lines, labels, loc="upper right", ncols=2)
+
+        self.ax1.grid(True, alpha=0.3)
+        self.canvas1.draw()
+
+    def draw_graph2(self):
+        self.ax2.clear()
+        l1, = self.ax2.plot(self.t, self.stride_len(), label="stride length (m)")
+        l2, = self.ax2.plot(self.t, self.phase_t, label="phase (0–1)")
+        l3, = self.ax2.plot(self.t, self.phase_rate, label="phase rate (1/s)")
+        l4, = self.ax2.plot(self.t, self.theta_t, label="theta (rad)")
+        l5, = self.ax2.plot(self.t, self.alpha_t, label="alpha (rad)")
+        # Right axis for torque & indicator
+        ax2r = self.ax2.twinx()
+        r1, = ax2r.plot(self.t, self.desired_torque_t, linestyle='--', label="desired torque (Nm)")
+        r2, = ax2r.plot(self.t, self.indicator_t, linestyle=':', label="indicator")
+
+        self.ax2.set_xlabel("Time (s)")
+        self.ax2.set_ylabel("Stride / Phase / Angles / Phase rate")
+        ax2r.set_ylabel("Torque / Indicator")
+
+        lines = [l1, l2, l3, l4, l5, r1, r2]
+        labels = [ln.get_label() for ln in lines]
+        self.ax2.legend(lines, labels, loc="upper right", ncols=2)
+
+        self.ax2.grid(True, alpha=0.3)
+        self.canvas2.draw()
+
+    def draw_graph3(self):
+        self.ax3.clear()
+        l1, = self.ax3.plot(self.t, self.forward_heel, label="forward heel pos (m)")
+        l2, = self.ax3.plot(self.t, self.upward_heel, label="upward heel pos (m)")
+        l3, = self.ax3.plot(self.t, self.foot_angle,  label="foot angle (rad)")
+        l4, = self.ax3.plot(self.t, self.shank_angle, label="shank angle (rad)")
+
+        self.ax3.set_xlabel("Time (s)")
+        self.ax3.set_ylabel("Position (m) / Angles (rad)")
+        self.ax3.legend(loc="upper right", ncols=2)
+        self.ax3.grid(True, alpha=0.3)
+        self.canvas3.draw()
+
+    # Example stride length as a function of phase (replace with your array if you have it vs time)
+    def stride_len(self):
+        # Create a stride length varying 1.0–1.4 m, reshaped through phase over time
+        return 1.2 + 0.2*np.sin(2*np.pi*self.phase_t + 0.5)
+
+    # ---------- Marker logic ----------
+    def set_phase_marker(self):
+        try:
+            p = float(self.phase_marker_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Phase marker must be a number in [0,1].")
+            return
+        if not (0.0 <= p <= 1.0):
+            messagebox.showerror("Invalid input", "Phase marker must be within [0,1].")
+            return
+
+        # Remove old marker line & points
+        if self.phase_vline is not None:
+            self.phase_vline.remove()
+            self.phase_vline = None
+        for scat in self.phase_markers: # Remove old scatter markers
+            scat.remove()
+        self.phase_markers.clear()
+
+        # Add vertical line
+        self.phase_vline = self.ax1.axhline(p, linestyle="--", alpha=0.7)
+
+        # Highlight nearest points for each series on Graph 1
+        idx = (np.abs(self.phase - p)).argmin() # index of closest phase value np.abs is used to get absolute value of difference and argmin gives index of minimum value
+        series = [
+            (self.sin_phase, "sin"),
+            (self.cos_phase, "cos"),
+            (self.theta_phase, "theta"),
+            (self.alpha_phase, "alpha"),
+        ]
+        # Right-axis series are plotted on twin axis but share same x
+        # We still plot scatter on left axes to visually pin the x; values will align vertically with the vline.
+        for y, _name in series:
+            s = self.ax1.scatter([self.phase[idx]], [y[idx]], zorder=5)
+            self.phase_markers.append(s)
+
+        # Also mark torque & accel on right axis by drawing scatter on the right axis
+        ax1r = self.ax1.twinx()  # temporary handle; find the existing right axis
+        # Matplotlib doesn’t easily give the existing twin—so we just re-get its limits and plot on ax1 again for visibility.
+        #s1 = self.ax1.scatter([p], [np.nan], alpha=0.0)  # spacer (no op)
+
+        self.canvas1.draw()
+
+    def set_time_marker(self):
+        try:
+            tt = float(self.time_marker_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Time marker must be a number (seconds).")
+            return
+        if tt < self.t[0] or tt > self.t[-1]:
+            messagebox.showerror("Out of range", f"Time must be within [{self.t[0]:.2f}, {self.t[-1]:.2f}] s.")
+            return
+
+        # Graph 2
+        if self.time_vline_g2 is not None:
+            self.time_vline_g2.remove()
+            self.time_vline_g2 = None
+        for scat in self.time_markers_g2:
+            scat.remove()
+        self.time_markers_g2.clear()
+
+        self.time_vline_g2 = self.ax2.axvline(tt, linestyle="--", alpha=0.7)
+        idx2 = (np.abs(self.t - tt)).argmin()
+        # Scatter on key series (left axis)
+        for y in [self.stride_len(), self.phase_t, self.phase_rate, self.theta_t, self.alpha_t]:
+            s = self.ax2.scatter([self.t[idx2]], [y[idx2]], zorder=5)
+            self.time_markers_g2.append(s)
+        self.canvas2.draw()
+
+        # Graph 3
+        if self.time_vline_g3 is not None:
+            self.time_vline_g3.remove()
+            self.time_vline_g3 = None
+        for scat in self.time_markers_g3:
+            scat.remove()
+        self.time_markers_g3.clear()
+
+        self.time_vline_g3 = self.ax3.axvline(tt, linestyle="--", alpha=0.7)
+        idx3 = idx2  # same time base
+        for y in [self.forward_heel, self.upward_heel, self.foot_angle, self.shank_angle]:
+            s = self.ax3.scatter([self.t[idx3]], [y[idx3]], zorder=5)
+            self.time_markers_g3.append(s)
+        self.canvas3.draw()
+
+    # ---------- Export ----------
+    def export_pngs(self):
+        # Ask directory
+        directory = filedialog.askdirectory(title="Choose export folder")
+        if not directory:
+            return
+        try:
+            self.fig1.savefig(f"{directory}/graph1_phase.png", bbox_inches="tight", dpi=150)
+            self.fig2.savefig(f"{directory}/graph2_time.png",  bbox_inches="tight", dpi=150)
+            self.fig3.savefig(f"{directory}/graph3_time.png",  bbox_inches="tight", dpi=150)
+            messagebox.showinfo("Exported", "Saved:\n- graph1_phase.png\n- graph2_time.png\n- graph3_time.png")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+if __name__ == "__main__":
+    app = GaitGraphsApp()
+    app.mainloop()

@@ -9,19 +9,21 @@ import os
 import numpy as np
 from PIL import Image, ImageTk
 import matplotlib
+import json
+import keras
+
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-Row=0
 
 # ==== Keras / TF (safe import) ====
 RUN_NN = False
+
 try:
-    from tensorflow.keras.models import load_model
+    from keras.models import load_model
 except Exception:
     load_model = None
-    RUN_NN = False
 
 # ==== PIL (safe import for logo) ====
 try:
@@ -41,7 +43,7 @@ except Exception:
 # ======================
 # USER SERIAL CONFIG (defaults)
 # ======================
-DEFAULT_PORT = "COM3"
+DEFAULT_PORT = "COM4"
 DEFAULT_BAUD = 115200
 
 # ======================
@@ -88,62 +90,111 @@ PKT_TELEM_ID = 0x30
 SER = None
 MODEL_PATH = "continousPhase.h5"
 
+
 # ======================
-# STANDARDIZATION (MEAN 0, STD 1) — Online (Welford) per feature
+# Standardization (mean 0, std 1) and stalking and also the low-pass filter parameters
 # ======================
-class OnlineFeatureScaler:
-    def __init__(self, n_features=7, clip=8.0, eps=1e-6):
-        self.n = 0
-        self.mean = np.zeros(n_features, dtype=np.float64)
-        self.M2 = np.zeros(n_features, dtype=np.float64)
-        self.clip = float(clip)
-        self.eps = float(eps)
+import numpy as np
 
-    def partial_fit(self, x):
-        x = np.asarray(x, dtype=np.float64)
-        if x.shape[-1] != self.mean.shape[0]:
-            raise ValueError("x has wrong length")
-        self.n += 1
-        delta = x - self.mean
-        self.mean += delta / max(self.n, 1)
-        delta2 = x - self.mean
-        self.M2 += delta * delta2
+class LowPassFilter:
+    def __init__(self, n_features=7, cutoff_hz=5.0, fs=50.0):
+        """
+        n_features : number of sensor features (e.g., 7)
+        cutoff_hz  : cutoff frequency of LPF (5 Hz)
+        fs         : sampling frequency of your sensor (Hz), here 50 Hz
+        """
+        self.n_features = n_features
+        self.cutoff_hz = cutoff_hz
+        self.fs = fs
 
-    def _std(self):
-        if self.n < 2:
-            return np.ones_like(self.mean, dtype=np.float64)
-        var = self.M2 / (self.n - 1)
-        return np.sqrt(np.maximum(var, self.eps))
+        dt = 1.0 / fs
+        RC = 1.0 / (2.0 * np.pi * cutoff_hz)
+        self.alpha = dt / (RC + dt)   # smoothing factor
 
-    def transform(self, x):
-        x = np.asarray(x, dtype=np.float64)
-        z = (x - self.mean) / self._std()
-        z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
-        z = np.clip(z, -self.clip, self.clip)
-        return z.astype(np.float32)
+        self.y = np.zeros(n_features, dtype=float)  # filtered state
+        self.initialized = False
 
-    def save(self, path="continousPhase_stats_live.npz"):
-        np.savez(path, n=self.n, mean=self.mean, M2=self.M2)
+    def update(self, x):
+        """
+        x: np.array shape (n_features,)
+        returns: filtered sample (same shape)
+        """
+        x = np.asarray(x, dtype=float)
 
-    def load(self, path="continousPhase_stats_live.npz"):
-        if not os.path.exists(path):
-            return False
-        try:
-            d = np.load(path)
-            self.n = int(d["n"])
-            self.mean = d["mean"].astype(np.float64)
-            self.M2 = d["M2"].astype(np.float64)
-            return True
-        except Exception:
-            return False
+        if not self.initialized:
+            self.y = x.copy()
+            self.initialized = True
+        else:
+            self.y = self.y + self.alpha * (x - self.y)
 
-SCALER = OnlineFeatureScaler(n_features=7, clip=8.0, eps=1e-6)
-SCALER.load("continousPhase_stats_live.npz")
-_last_scaler_save = time.time()
+        return self.y.copy()
+
+
+class Preprocessor50Hz:
+    """
+    Pipeline:
+    raw(7,) → 5 Hz LPF (fs=50 Hz) → standardization (sliding mean/std of buffer)
+            → rolling 10×7 matrix
+    """
+    def __init__(self, n_features=7, max_rows=10, cutoff_hz=5.0, fs=50.0):
+        self.n_features = n_features
+        self.max_rows = max_rows
+
+        # empty buffer: 0 x n_features
+        self.buffer = np.empty((0, n_features), dtype=float)
+
+        # 5 Hz low-pass at 50 Hz
+        self.lpf = LowPassFilter(n_features=n_features,
+                                 cutoff_hz=cutoff_hz,
+                                 fs=fs)
+
+    def _add_and_stack(self, filtered_sample):
+        """Same standardization + vstack logic as before."""
+        filtered_sample = np.asarray(filtered_sample, dtype=float)
+
+        # if we have at least 2 rows, use buffer stats to standardize
+        if self.buffer.shape[0] >= 2:
+            mean = self.buffer.mean(axis=0)
+            std = self.buffer.std(axis=0)
+            std[std == 0.0] = 1.0
+
+            std_sample = (filtered_sample - mean) / std
+        else:
+            # not enough history → keep filtered values as-is
+            std_sample = filtered_sample
+
+        # stack with vstack
+        self.buffer = np.vstack([self.buffer, std_sample])
+
+        # keep only last max_rows rows
+        if self.buffer.shape[0] > self.max_rows:
+            self.buffer = self.buffer[-self.max_rows:, :]
+
+    def step(self, raw_sample):
+        """
+        Process one new raw 7-feature sensor reading.
+        raw_sample: array-like shape (7,)
+        Returns: current buffer of shape (<=10, 7)
+        """
+        # 1) low-pass filter
+        filtered = self.lpf.update(raw_sample)
+
+        # 2) standardize + push into rolling buffer
+        self._add_and_stack(filtered)
+
+        # 3) return the current 10x7 (or smaller at startup)
+        return self.buffer
+
+    def get_buffer(self):
+        """Get current buffer without adding a new sample."""
+        return self.buffer
+
+
 
 # ======================
 # Serial helpers
 # ======================
+
 def safe_open_serial(port, baud):
     global SER
     if serial is None:
@@ -329,16 +380,504 @@ def make_feature_vector(parsed, angle_alpha_rad):
         float(parsed["gyroZ"]),
     ], dtype=np.float32)
 
+
+
 # ======================
-# GUI (keeps your previous theme/format)
+# Serial helpers
 # ======================
-class Mini_GUI(tk.Tk):
+def safe_open_serial(port, baud):
+    global SER
+    if serial is None:
+        return None
+    try:
+        ser = serial.Serial(port, baud, timeout=0.01)
+        time.sleep(2.0)  # MCU reset delay
+        SER = ser
+        return SER
+    except Exception:
+        SER = None
+        return None
+
+def safe_close_serial():
+    global SER
+    try:
+        if SER and SER.is_open:
+            SER.close()
+    except Exception:
+        pass
+    SER = None
+
+class AssistiveTorque:
+    """
+    τ(GP, α) = BW_gain · f(GP) · s(GP) · r(α)^(-1)
+      f(GP) = exp( - (GP-μ)^2 / (2σ^2) )
+      s(GP) = (p+1)/(exp((GP-c)/d) + 1) - p
+      r(α)  = 1 + Krep*(exp(α0-α) + exp(α-α1))
+    GP in [0,1], angles in radians internally.
+    """
+    def __init__(self, mu=0.5, sigma=0.17, c=0.6, d=0.02, p=0.8,
+                 alpha0_deg=-10.0, alpha1_deg=10.0, K_rep=1.0, BW_gain=1.0):
+        self.mu = mu
+        self.sigma = sigma
+        self.c = c
+        self.d = d
+        self.p = p
+        self.alpha0 = np.deg2rad(alpha0_deg)
+        self.alpha1 = np.deg2rad(alpha1_deg)
+        self.K_rep = K_rep
+        self.BW_gain = BW_gain
+
+    def f(self, GP): return np.exp(-((GP - self.mu) ** 2) / (2 * self.sigma ** 2))
+    def s(self, GP): return (self.p + 1) / (np.exp((GP - self.c) / self.d) + 1) - self.p
+    def r(self, alpha): return 1 + self.K_rep * (np.exp(self.alpha0 - alpha) + np.exp(alpha - self.alpha1))
+    def tau(self, GP, alpha): return self.BW_gain * self.f(GP) * self.s(GP) / self.r(alpha)
+
+
+
+class TorqueGUI(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.pack(fill=tk.BOTH, expand=True)
+        self.model = AssistiveTorque()
+        self.streaming = False
+        self.prev_tau = None
+
+        # --- TOP TOOLBAR ---
+        toolbar = ttk.Frame(self, padding=(8, 6))
+        toolbar.pack(fill=tk.X, side=tk.TOP)
+        #ttk.Label(toolbar, text="Assistive Torque Controller", font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
+
+        # Presets
+        self.presets = {
+            "Default": dict(gp=50, alpha=0, bw=1, mu=0.5, sigma=0.17, c=0.6, d=0.02, p=0.8, a0=-10, a1=10, krep=1),
+            "Heel-Strike Assist": dict(gp=5, alpha=-5, bw=1.2, mu=0.1, sigma=0.12, c=0.18, d=0.02, p=0.6, a0=-12, a1=8, krep=1.2),
+            "Push-Off Boost": dict(gp=60, alpha=6, bw=1.5, mu=0.6, sigma=0.14, c=0.55, d=0.02, p=0.9, a0=-8, a1=12, krep=0.8),
+        }
+        preset_box = ttk.Frame(toolbar); preset_box.pack(side=tk.LEFT, padx=(12, 6))
+        ttk.Label(preset_box, text="Preset:").pack(side=tk.LEFT)
+        self.preset_var = tk.StringVar(value="Default")
+        ttk.Combobox(preset_box, width=18, textvariable=self.preset_var,
+                     values=list(self.presets.keys()), state="readonly").pack(side=tk.LEFT, padx=4)
+        ttk.Button(preset_box, text="Apply", command=self.apply_preset).pack(side=tk.LEFT)
+
+        # Buttons
+        btns = ttk.Frame(toolbar); btns.pack(side=tk.RIGHT)
+        self.play_btn = ttk.Button(btns, text="⏸ Pause IMU", command=self.toggle_stream)
+        self.play_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="⟳ Reset", command=self.reset_params).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="⬇ Save Figures", command=self.save_figs).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="💾 Save Params", command=self.save_params).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="📂 Load Params", command=self.load_params).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="📌 Freeze τ", command=self.freeze_curve).pack(side=tk.LEFT, padx=4)
+
+        # --- SPLIT: LEFT (controls + τ) | RIGHT (plots + log) ---
+        splitter = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        splitter.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        # LEFT pane
+        left_pane = ttk.Frame(splitter)
+        splitter.add(left_pane, weight=1)
+        ctrl = ttk.Frame(left_pane); ctrl.pack(fill=tk.BOTH, expand=True)
+        ctrl.grid_rowconfigure(0, weight=1)
+        ctrl.grid_rowconfigure(1, weight=4)
+        ctrl.grid_columnconfigure(0, weight=1)
+
+        # Parameters (scrollable)
+        params_card = ttk.LabelFrame(ctrl, text="Parameters")
+        params_card.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 4))
+        params_wrap = ttk.Frame(params_card); params_wrap.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(params_wrap, height=240, highlightthickness=0)
+        vbar = ttk.Scrollbar(params_wrap, orient="vertical", command=canvas.yview)
+        self.params_inner = ttk.Frame(canvas)
+        self.params_inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        inner = canvas.create_window((0, 0), window=self.params_inner, anchor="nw")
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+        params_wrap.bind("<Configure>", lambda e: canvas.itemconfig(inner, width=params_wrap.winfo_width()))
+
+        # τ model plot
+        Torq_Ctrl_plt = ttk.LabelFrame(ctrl, text="Assistive Torque Model")
+        Torq_Ctrl_plt.grid(row=1, column=0, sticky="nsew", padx=6, pady=(4, 6))
+        Torq_Ctrl_plt.grid_rowconfigure(0, weight=1); Torq_Ctrl_plt.grid_columnconfigure(0, weight=1)
+
+        # RIGHT pane
+        right_pane = ttk.Frame(splitter)
+        splitter.add(right_pane, weight=2)
+        right_pane.rowconfigure(0, weight=3)
+        right_pane.rowconfigure(1, weight=2)
+        right_pane.rowconfigure(2, weight=2)
+        right_pane.columnconfigure(0, weight=1)
+
+        # IMU plots block
+        plot = ttk.LabelFrame(right_pane, text="Plots")
+        plot.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 3))
+        plot.grid_rowconfigure(0, weight=1); plot.grid_columnconfigure(0, weight=1)
+
+        # --- Matplotlib: τ + f/s/r ---
+        self.fig = Figure(figsize=(6.6, 3.8), dpi=100, layout="constrained")
+        gs = self.fig.add_gridspec(3, 2, height_ratios=[1, 1, 1], width_ratios=[2.6, 1.2], hspace=0.28, wspace=0.28)
+        self.ax_tau = self.fig.add_subplot(gs[:, 0])
+        self.ax_f = self.fig.add_subplot(gs[0, 1])
+        self.ax_s = self.fig.add_subplot(gs[1, 1])
+        self.ax_r = self.fig.add_subplot(gs[2, 1])
+        self.ax_phase = self.ax_tau.inset_axes([0.08, 0.03, 0.84, 0.12])
+        self.canvas = FigureCanvasTkAgg(self.fig, master=Torq_Ctrl_plt)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        # --- IMU figure ---
+        self.fig_imu = Figure(figsize=(6.6, 3.2), dpi=100, layout="constrained")
+        imu_gs = self.fig_imu.add_gridspec(3, 1, hspace=0.24)
+        self.ax_accel = self.fig_imu.add_subplot(imu_gs[0, 0])
+        self.ax_speed = self.fig_imu.add_subplot(imu_gs[1, 0])
+        self.ax_angle = self.fig_imu.add_subplot(imu_gs[2, 0])
+        self.canvas_imu = FigureCanvasTkAgg(self.fig_imu, master=plot)
+        self.canvas_imu.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        # --- LOG (Tab 2) ---
+        log_frame2 = ttk.LabelFrame(right_pane, text="Log")
+        log_frame2.grid(row=1, column=0, sticky="nsew", padx=6, pady=(3, 6))
+        log_frame2.rowconfigure(0, weight=1)
+        log_frame2.columnconfigure(0, weight=1)
+        self.log2 = tk.Text(log_frame2, height=10, wrap="none", state="disabled")
+        self.log2.grid(row=0, column=0, sticky="nsew")
+        vs2 = ttk.Scrollbar(log_frame2, orient="vertical", command=self.log2.yview)
+        hs2 = ttk.Scrollbar(log_frame2, orient="horizontal", command=self.log2.xview)
+        self.log2.configure(yscrollcommand=vs2.set, xscrollcommand=hs2.set)
+        vs2.grid(row=0, column=1, sticky="ns")
+        hs2.grid(row=1, column=0, sticky="ew")
+
+        # --- STATUS LINE (bottom of tab 2) ---
+        self.status = ttk.Label(right_pane, anchor="w")
+        self.status.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+
+        # --------------- SLIDER HELPER (fixed to not fire init callbacks) ---------------
+        def add_slider(frame, label, frm, to, init, cmd, unit=""):
+            row = ttk.Frame(frame, height=26)
+            row.pack(fill=tk.X, pady=2, padx=6)
+            row.pack_propagate(False)
+
+            ttk.Label(row, text=label, width=14, anchor="w").pack(side=tk.LEFT)
+            s = ttk.Scale(row, from_=frm, to=to, orient=tk.HORIZONTAL, length=170)
+            val = ttk.Label(row, width=8, anchor="e")
+            val.pack(side=tk.RIGHT)
+            s.pack(side=tk.LEFT, padx=6)
+
+            # Set initial value and label BEFORE binding command (prevents early callback)
+            s.set(init)
+            val.config(text=f"{init:.2f}{unit}")
+
+            def _on_move(_=None):
+                try:
+                    val.config(text=f"{s.get():.2f}{unit}")
+                    if cmd:
+                        cmd()
+                except Exception:
+                    pass
+
+            s.configure(command=_on_move)
+            return s
+
+        # Collapsible groups
+        def collapsible(parent, title):
+            f = ttk.Frame(parent); bar = ttk.Frame(f); bar.pack(fill=tk.X, pady=(3, 0))
+            sv = tk.StringVar(value="▼ " + title); lbl = ttk.Label(bar, textvariable=sv); lbl.pack(side=tk.LEFT, padx=2)
+            body = ttk.Frame(f); body.pack(fill=tk.X, padx=2, pady=(2,0))
+            def toggle(_=None):
+                if body.winfo_manager(): body.pack_forget(); sv.set("► " + title)
+                else: body.pack(fill=tk.X, padx=2, pady=(2,0)); sv.set("▼ " + title)
+            bar.bind("<Button-1>", toggle); lbl.bind("<Button-1>", toggle)
+            return f, body
+
+        # ---- Create all sliders (attributes exist before any callback runs) ----
+        grp_core, core_body = collapsible(self.params_inner, "Core Controls"); grp_core.pack(fill=tk.X)
+        self.gp_percent = add_slider(core_body, "GP (%)", 0, 100, 50, self.update_static_plots, "%")
+        self.alpha_deg  = add_slider(core_body, "α (deg)", -30, 30, 0, self.update_static_plots, "°")
+        self.bw_gain    = add_slider(core_body, "BW gain", 0, 2.5, 1, self._update_model)
+
+        grp_f, body_f = collapsible(self.params_inner, "f(GP)"); grp_f.pack(fill=tk.X)
+        self.mu    = add_slider(body_f, "μ", 0, 1, 0.5, self._update_model)
+        self.sigma = add_slider(body_f, "σ", 0.05, 0.4, 0.17, self._update_model)
+
+        grp_s, body_s = collapsible(self.params_inner, "s(GP)"); grp_s.pack(fill=tk.X)
+        self.c   = add_slider(body_s, "c", 0, 1, 0.6, self._update_model)
+        self.d   = add_slider(body_s, "d", 0.005, 0.1, 0.02, self._update_model)
+        self.p   = add_slider(body_s, "p", 0, 1.5, 0.8, self._update_model)
+
+        grp_r, body_r = collapsible(self.params_inner, "r(α)"); grp_r.pack(fill=tk.X)
+        self.a0   = add_slider(body_r, "α0 (deg)", -40, 0, -10, self._update_model, "°")
+        self.a1   = add_slider(body_r, "α1 (deg)", 0, 40, 10, self._update_model, "°")
+        self.krep = add_slider(body_r, "Krep", 0, 5, 1, self._update_model)
+
+        # IMU sim buffers
+        self.window_sec, self.fs = 10, 50
+        self.dt, self.max_samples = 1/self.fs, int(self.window_sec * self.fs)
+        self.tbuf, self.accX, self.accY, self.accZ = [deque(maxlen=self.max_samples) for _ in range(4)]
+        self.angX, self.angZ, self.theta, self.alphaZ = [deque(maxlen=self.max_samples) for _ in range(4)]
+        self.t0 = time.perf_counter(); self._next_t = 0
+
+        # Autoscale lock
+        self.lock_tau = tk.BooleanVar(master=self, value=False)
+        ttk.Checkbutton(Torq_Ctrl_plt, text="Lock τ autoscale", variable=self.lock_tau).place(relx=0.01, rely=0.02)
+
+        # Mouse crosshair
+        self._mh = self.canvas.mpl_connect("motion_notify_event", self._on_move_tau)
+
+        # First draw AFTER all widgets exist
+        self.update_static_plots()
+        self._imu_loop()
+
+        # Shortcuts
+        self.bind_all("<space>", lambda e: self.toggle_stream())
+        self.bind_all("<Control-r>", lambda e: self.reset_params())
+        self.bind_all("<Control-s>", lambda e: self.save_figs())
+
+        self._log2("Torque GUI ready.")
+
+    # ---------------- Helpers: Log for Tab 2 ----------------
+    def _log2(self, msg: str):
+        if not hasattr(self, "log2"): return
+        ts = time.strftime("%H:%M:%S")
+        self.log2.configure(state="normal")
+        self.log2.insert("end", f"[{ts}] {msg}\n")
+        self.log2.see("end")
+        self.log2.configure(state="disabled")
+
+    # ---------------- Toolbar actions ----------------
+    def toggle_stream(self):
+        self.streaming = not self.streaming
+        self.play_btn.config(text="▶ Resume IMU" if not self.streaming else "⏸ Pause IMU")
+        self._log2("IMU streaming: " + ("PAUSED" if not self.streaming else "RESUMED"))
+
+    def reset_params(self):
+        for s, val in [
+            (self.gp_percent, 50), (self.alpha_deg, 0), (self.bw_gain, 1),
+            (self.mu, 0.5), (self.sigma, 0.17),
+            (self.c, 0.6), (self.d, 0.02), (self.p, 0.8),
+            (self.a0, -10), (self.a1, 10), (self.krep, 1),
+        ]:
+            s.set(val)
+        self.prev_tau = None
+        self._update_model()
+        self._log2("Parameters reset to defaults.")
+
+    def save_figs(self):
+        try:
+            path = filedialog.asksaveasfilename(
+                title="Save main figure as...",
+                defaultextension=".png",
+                filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")]
+            )
+            if not path: return
+            self.fig.savefig(path, dpi=150, bbox_inches="tight")
+            base, ext = path.rsplit(".", 1)
+            imu_path = f"{base}_imu.{ext}"
+            self.fig_imu.savefig(imu_path, dpi=150, bbox_inches="tight")
+            messagebox.showinfo("Saved", f"Figures saved:\n• {path}\n• {imu_path}")
+            self._log2(f"Saved figures to {path} and {imu_path}")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
+            self._log2(f"Save error: {e}")
+
+    def save_params(self):
+        m = self._get_sliders()
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON","*.json")])
+        if not path:
+            self._log2("Save params canceled.")
+            return
+        try:
+            with open(path, "w") as f: json.dump(m, f, indent=2)
+            self._log2(f"Parameters saved: {path}")
+        except Exception as e:
+            messagebox.showerror("Save Params Error", str(e))
+            self._log2(f"Save params error: {e}")
+
+    def load_params(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON","*.json")])
+        if not path:
+            self._log2("Load params canceled.")
+            return
+        try:
+            with open(path) as f: m = json.load(f)
+            self._set_sliders(m)
+            self._log2(f"Parameters loaded: {path}")
+        except Exception as e:
+            messagebox.showerror("Load Params Error", str(e))
+            self._log2(f"Load params error: {e}")
+
+    def freeze_curve(self):
+        GP = np.linspace(0, 1, 600)
+        alpha = np.deg2rad(float(self.alpha_deg.get()))
+        self.prev_tau = (GP, self.model.tau(GP, alpha))
+        self.update_static_plots()
+        self._log2("Current τ curve frozen for comparison.")
+
+    def apply_preset(self):
+        name = self.preset_var.get()
+        self._set_sliders(self.presets[name])
+        self._log2(f"Preset applied: {name}")
+
+    def _set_sliders(self, m):
+        self.gp_percent.set(m["gp"]); self.alpha_deg.set(m["alpha"]); self.bw_gain.set(m["bw"])
+        self.mu.set(m["mu"]); self.sigma.set(m["sigma"])
+        self.c.set(m["c"]); self.d.set(m["d"]); self.p.set(m["p"])
+        self.a0.set(m["a0"]); self.a1.set(m["a1"]); self.krep.set(m["krep"])
+        self._update_model()
+
+    def _get_sliders(self):
+        return dict(
+            gp=self.gp_percent.get(), alpha=self.alpha_deg.get(), bw=self.bw_gain.get(),
+            mu=self.mu.get(), sigma=self.sigma.get(), c=self.c.get(), d=self.d.get(), p=self.p.get(),
+            a0=self.a0.get(), a1=self.a1.get(), krep=self.krep.get()
+        )
+
+    def _update_model(self):
+        m = self.model
+        m.mu, m.sigma, m.c, m.d, m.p, m.BW_gain = map(float,
+            [self.mu.get(), self.sigma.get(), self.c.get(), self.d.get(), self.p.get(), self.bw_gain.get()])
+        m.alpha0, m.alpha1, m.K_rep = radians(float(self.a0.get())), radians(float(self.a1.get())), float(self.krep.get())
+        self.update_static_plots()
+
+    def _shade_gait(self):
+        phases = [(0,10,"HS"), (10,50,"Stance"), (50,60,"TO"), (60,100,"Swing")]
+        for a,b,name in phases:
+            self.ax_tau.axvspan(a, b, alpha=0.07)
+            self.ax_tau.text((a+b)/2, 0.98, name,
+                             transform=self.ax_tau.get_xaxis_transform(),
+                             ha="center", va="top", fontsize=8)
+
+    def _on_move_tau(self, ev):
+        if ev.inaxes != self.ax_tau: return
+        self.update_static_plots()
+        try:
+            self.ax_tau.axvline(ev.xdata, ls=":", lw=1)
+            self.ax_tau.axhline(ev.ydata, ls=":", lw=1)
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def update_static_plots(self):
+        GP = np.linspace(0, 1, 600)
+        alpha = np.deg2rad(float(self.alpha_deg.get()))
+        gp_now = float(self.gp_percent.get()) / 100
+        tau = self.model.tau(GP, alpha)
+
+        self.ax_tau.clear()
+        self.ax_tau.plot(GP * 100, tau, lw=2, label="τ(GP, α)")
+        self.ax_tau.axvline(gp_now * 100, ls="--", lw=1)
+        self.ax_tau.scatter(gp_now * 100, self.model.tau(gp_now, alpha), s=55, zorder=5, label="Now")
+
+        SAFE_MIN, SAFE_MAX = -0.6, 0.8
+        self.ax_tau.axhspan(SAFE_MIN, SAFE_MAX, alpha=0.08)
+        self.ax_tau.text(0.99, 0.99, "Safe band", transform=self.ax_tau.transAxes, ha="right", va="top", fontsize=8)
+
+        self.ax_tau.grid(True, which="major", alpha=0.30)
+        self.ax_tau.grid(True, which="minor", alpha=0.15)
+        self.ax_tau.minorticks_on()
+        self.ax_tau.set_xlim(0, 100)
+        if not self.lock_tau.get():
+            pad = (np.max(np.abs(tau)) * 0.15) + 1e-9
+            self.ax_tau.set_ylim(np.min(tau) - pad, np.max(tau) + pad)
+        self.ax_tau.set_title("Torque τ(GP, α)")
+        self.ax_tau.set_xlabel("Gait phase GP [%]")
+        self.ax_tau.set_ylabel("Torque (scaled)")
+
+        self._shade_gait()
+
+        self.ax_phase.clear()
+        self.ax_phase.plot([0, 100], [0.5, 0.5], lw=2)
+        self.ax_phase.scatter([gp_now * 100], [0.5], s=60, zorder=5)
+        self.ax_phase.set_xlim(0, 100); self.ax_phase.get_yaxis().set_visible(False)
+        self.ax_phase.set_xticks([0, 25, 50, 75, 100]); self.ax_phase.tick_params(axis='x', labelsize=8)
+
+        self.ax_f.clear(); self.ax_f.plot(GP * 100, self.model.f(GP)); self.ax_f.set_title("f(GP)"); self.ax_f.grid(True, alpha=0.3)
+        self.ax_s.clear(); self.ax_s.plot(GP * 100, self.model.s(GP)); self.ax_s.set_title("s(GP)"); self.ax_s.grid(True, alpha=0.3)
+        a_scan = np.deg2rad(np.linspace(-40, 40, 400))
+        self.ax_r.clear(); self.ax_r.plot(np.rad2deg(a_scan), self.model.r(a_scan)); self.ax_r.axvline(np.rad2deg(alpha), ls="--", lw=1)
+        self.ax_r.set_title("r(α)"); self.ax_r.grid(True, alpha=0.3)
+
+        if self.prev_tau is not None:
+            GPp, taup = self.prev_tau
+            self.ax_tau.plot(GPp * 100, taup, lw=1, linestyle="--", label="Frozen τ")
+
+        self.ax_tau.legend(loc="upper left", fontsize=8)
+        self.status.config(text=f"GP={self.gp_percent.get():.1f}% | α={self.alpha_deg.get():.1f}° | BW={self.bw_gain.get():.2f}")
+        self.canvas.draw_idle()
+
+    def _imu_loop(self):
+        if self.streaming:
+            if not hasattr(self, "t0"):
+                self.t0 = time.perf_counter()
+            if not hasattr(self, "_next_t"):
+                self._next_t = 0
+            if not hasattr(self, "tbuf"):
+                self.window_sec, self.fs = 10, 50
+                self.dt, self.max_samples = 1/self.fs, int(self.window_sec * self.fs)
+                self.tbuf, self.accX, self.accY, self.accZ = [deque(maxlen=self.max_samples) for _ in range(4)]
+                self.angX, self.angZ, self.theta, self.alphaZ = [deque(maxlen=self.max_samples) for _ in range(4)]
+
+            while self._next_t <= (time.perf_counter() - self.t0):
+                t = self._next_t
+                ax = 0.20*np.sin(2*np.pi*t) + 0.01*np.random.randn()
+                ay = 0.10*np.cos(4*np.pi*t) + 0.01*np.random.randn()
+                az = 1.00 + 0.05*np.sin(2*np.pi*t) + 0.01*np.random.randn()
+                wx = 2.0*np.sin(2*np.pi*t) + 0.05*np.random.randn()
+                wz = 1.5*np.cos(2*np.pi*t) + 0.05*np.random.randn()
+                th = 15.0*np.sin(2*np.pi*t) + 0.5*np.random.randn()
+                al = 10.0*np.cos(2*np.pi*t) + 0.5*np.random.randn()
+
+                self.tbuf.append(t)
+                for buf, val in zip([self.accX,self.accY,self.accZ,self.angX,self.angZ,self.theta,self.alphaZ],
+                                    [ax,ay,az,wx,wz,th,al]):
+                    buf.append(val)
+                self._next_t += 1/self.fs
+
+            if self.tbuf:
+                t0_view = self.tbuf[-1] - self.window_sec
+                x = np.array(self.tbuf) - max(t0_view, 0)
+            else:
+                x = np.array([0.0])
+            self._draw_imu(x)
+
+        self.after(20, self._imu_loop)
+
+    def _draw_imu(self, x):
+        self.ax_accel.clear()
+        self.ax_accel.plot(x, list(self.accX), label="accX")
+        self.ax_accel.plot(x, list(self.accY), label="accY")
+        self.ax_accel.plot(x, list(self.accZ), label="accZ")
+        self.ax_accel.legend(loc="upper right", fontsize=8)
+        self.ax_accel.set_ylabel("g"); self.ax_accel.set_title("Accelerometer [X, Y, Z]")
+        self.ax_accel.set_xlim(0, self.window_sec); self.ax_accel.grid(True, alpha=0.25)
+
+        self.ax_speed.clear()
+        self.ax_speed.plot(x, list(self.angX), label="ωx")
+        self.ax_speed.plot(x, list(self.angZ), label="ωz")
+        self.ax_speed.legend(loc="upper right", fontsize=8)
+        self.ax_speed.set_ylabel("rad/s"); self.ax_speed.set_title("Angular Speed [X, Z]")
+        self.ax_speed.set_xlim(0, self.window_sec); self.ax_speed.grid(True, alpha=0.25)
+
+        self.ax_angle.clear()
+        self.ax_angle.plot(x, list(self.theta), label="θ (X)")
+        self.ax_angle.plot(x, list(self.alphaZ), label="α (Z)")
+        self.ax_angle.legend(loc="upper right", fontsize=8)
+        self.ax_angle.set_ylabel("deg"); self.ax_angle.set_xlabel("Time [s]")
+        self.ax_angle.set_title("Angle Position [θ, α]")
+        self.ax_angle.set_xlim(0, self.window_sec); self.ax_angle.grid(True, alpha=0.25)
+
+        self.canvas_imu.draw_idle()
+
+
+class Application(tk.Tk):
     """Ankle Exoskeleton Control GUI."""
     def __init__(self):
         super().__init__()
         self.title("Ankle Exoskeleton Control GUI By Tinsae Tesfamichael")
         self.geometry("1000x600")
-        self.minsize(1000, 950)
+        self.minsize(1200, 800)
+        
+        self.no_row = 0
+        self.no_col = 0
 
         # ---------- mirrored telemetry ----------
         self.angle_theta = 0.0
@@ -390,38 +929,20 @@ class Mini_GUI(tk.Tk):
         for r in range(6):
             self.main_frame.grid_rowconfigure(r, weight=0) # 
         self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_columnconfigure(1, weight=1)
 
         # Build UI sections
+        self.build_mainbar()        # row 1 col 0..1
         self.build_logobar()          # row 0 col 0..1
         self.build_toolbar()          # row 1 col 0..1
         self.build_calibration_bar()  # row 2 col 0..1
+        self.Tabs()                   # row 3 col 0..1
         self.build_controls()         # row 3 col 0
         self.build_inputs()           # row 3 col 1
         self.status_bar()             # row 4 col 0
         self.build_log()              # row 4 col 1
         #self.graphs()                 # row 5 the whole thing
 
-        # Buffers / threads / timers
-        self.PLOT_DEPTH = 400
-        self.t_axis = deque(maxlen=self.PLOT_DEPTH)
-        self.th_axis = deque(maxlen=self.PLOT_DEPTH)
-        self.sp_axis = deque(maxlen=self.PLOT_DEPTH)
-        self.tq_axis = deque(maxlen=self.PLOT_DEPTH)
-        self._plot_init_time = time.time()
-
-        self._last_packet = None
-        self.reader_thread = threading.Thread(target=self._reader_worker, daemon=True)
-        self.reader_thread.start()
-
-        self.nn_thread = threading.Thread(target=self._nn_worker, daemon=True)
-        self.nn_thread.start()
-
-        self.after(120, self.poll_serial_binary)
-        self.after(250, self._update_status)
-        self.after(500, self._refresh_ports_combo)
-
-        self.protocol("WM_DELETE_WINDOW", self.on_exit)
+        
 
     # -------- styles (same spirit as your earlier code) --------
     def _init_styles(self):
@@ -433,11 +954,17 @@ class Mini_GUI(tk.Tk):
         s.configure("Ok.TLabel",   foreground="#059669")  # green
         s.configure("Warn.TLabel", foreground="#dc2626")  # red
         s.configure("Info.TLabel", foreground="#374151")  # gray
+        
+    # -------- mainbar --------
+    def build_mainbar(self):
+        self.main_bar = tk.Frame(self.main_frame, bd=0)
+        self.main_bar.grid(row=self.no_row, column=self.no_col, sticky="ew")
+        for c in range(1): self.main_bar.columnconfigure(c, weight=1) # even spacing
     
     # -------- sections --------
     def build_logobar(self):
-        logo_frame = tk.Frame(self.main_frame, bd=0, relief=tk.RIDGE )
-        logo_frame.grid(row=Row, column=0,rowspan=2, columnspan=4, sticky="ew")
+        logo_frame = tk.Frame(self.main_bar, bd=0, relief=tk.RIDGE )
+        logo_frame.grid(row=0, column=0,rowspan=2, columnspan=4, sticky="ew")
         if Image and ImageTk:
             try:
                 img = Image.open(r"C:\Users\Tinsae Tesfamichael\Desktop\Thesis\[_Final_code]\Final_Code\Final\src\icon.png")
@@ -454,40 +981,39 @@ class Mini_GUI(tk.Tk):
                 tk.Label(logo_frame, text="Ankle Exoskeleton Control").pack(padx=10, pady=10)
         else:
             tk.Label(logo_frame, text="Ankle Exoskeleton Control").pack(padx=10, pady=10)
-
     def build_toolbar(self):
-        bar = ttk.Frame(self.main_frame, padding=(8, 6))
-        bar.grid(row=Row+2, column=0, columnspan=2, sticky="ew")
+        self.toolbar = tk.Frame(self.main_bar, bd=1)
+        self.toolbar.grid(row=self.no_row+2, column=self.no_col, sticky="ew")
+        
+        for c in range(8): self.toolbar.columnconfigure(c, weight=0)
+        self.toolbar.columnconfigure(8, weight=1) # 
 
-        for c in range(8): bar.columnconfigure(c, weight=0)
-        bar.columnconfigure(8, weight=1) # 
-
-        ttk.Label(bar, text="Port").grid(row=0, column=0, sticky="w")
-        self.port_combo = ttk.Combobox(bar, textvariable=self.current_port, width=15, values=[])
+        ttk.Label(self.toolbar, text="Port").grid(row=0, column=0, sticky="w")
+        self.port_combo = ttk.Combobox(self.toolbar, textvariable=self.current_port, width=15, values=["COM1", "COM2", "COM3", "COM4", "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyS0"])
         self.port_combo.grid(row=0, column=1, padx=(4, 10), sticky="w")
 
-        ttk.Label(bar, text="Baud").grid(row=0, column=2, sticky="w")
+        ttk.Label(self.toolbar, text="Baud").grid(row=0, column=2, sticky="w")
         self.baud_combo = ttk.Combobox(
-            bar, textvariable=self.current_baud, width=10,
+            self.toolbar, textvariable=self.current_baud, width=10,
             values=[9600, 19200, 38400, 57600, 115200, 230400]
         )
         self.baud_combo.grid(row=0, column=3, padx=(4, 10), sticky="w")
 
-        self.connect_btn = ttk.Button(bar, text="Connect", command=self._connect_clicked, state="normal")
+        self.connect_btn = ttk.Button(self.toolbar, text="Connect", command=self._connect_clicked, state="normal")
         self.connect_btn.grid(row=0, column=4, padx=2)
 
-        self.disconnect_btn = ttk.Button(bar, text="Disconnect", command=self._disconnect_clicked, state="disabled")
+        self.disconnect_btn = ttk.Button(self.toolbar, text="Disconnect", command=self._disconnect_clicked, state="disabled")
         self.disconnect_btn.grid(row=0, column=5, padx=2)
 
-        self.safe_btn = tk.Button(bar, text="SAFE LATCH: OFF", command=self.on_isitsafe, width=18, bg="#ff0000")
+        self.safe_btn = tk.Button(self.toolbar, text="SAFE LATCH: OFF", command=self.on_isitsafe, width=18, bg="#ff0000")
         self.safe_btn.grid(row=0, column=6, padx=(14, 0))
 
-        self.conn_label = ttk.Label(bar, text="Not connected")
+        self.conn_label = ttk.Label(self.toolbar, text="Not connected")
         self.conn_label.grid(row=0, column=8, sticky="e")
-
+        
     def build_calibration_bar(self):
-        cal_bar = ttk.LabelFrame(self.main_frame, text="Calibration status", padding=(8, 6))
-        cal_bar.grid(row=Row+3, column=0, columnspan=2, sticky="ew", padx=4, pady=0)
+        cal_bar = ttk.LabelFrame(self.main_bar, text="Calibration status", padding=(8, 6))
+        cal_bar.grid(row=self.no_row+3, column=0, columnspan=2, sticky="ew", padx=4, pady=0)
         for c in range(8): cal_bar.columnconfigure(c, weight=1)
 
         ttk.Label(cal_bar, text="Encoder:").grid(row=0, column=0, sticky="e", padx=(0, 6))
@@ -505,10 +1031,42 @@ class Mini_GUI(tk.Tk):
         ttk.Label(cal_bar, text="Magnetometer:").grid(row=0, column=6, sticky="e", padx=(10, 6))
         self.mag_cal_lbl = ttk.Label(cal_bar, textvariable=self.mag_cal_status, style="Warn.TLabel")
         self.mag_cal_lbl.grid(row=0, column=7, sticky="w")
+    
+    
+    ######################################################################
+    ############### Tabs: Main and Plots (TorqueGUI) #####################
+    ######################################################################
 
+    def Tabs(self):
+        tabs_bar_main = ttk.Notebook(self.main_frame)
+        tabs_bar_main.grid(row=self.no_row+4, column=self.no_col, sticky="nsew")
+        self.main_frame.grid_rowconfigure(self.no_row+4, weight=1)
+
+        # Create Main tab frame
+        self.main_tab = ttk.Frame(tabs_bar_main)
+        tabs_bar_main.add(self.main_tab, text="Main")
+        self.main_tab.columnconfigure(0, weight=1)
+        self.main_tab.columnconfigure(1, weight=1)
+
+        # Create Plots tab frame
+        self.plot_tab = ttk.Frame(tabs_bar_main)
+        tabs_bar_main.add(self.plot_tab, text="Plots")
+        # Add a vertical scrollbar
+        scrollbar = ttk.Scrollbar(self.plot_tab, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+
+        # Add a canvas to hold the content
+        canvas = tk.Canvas(self.plot_tab, yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+
+        scrollbar.config(command=canvas.yview)
+
+        # Initialize TorqueGUI in the plot_tab
+        # TorqueGUI(canvas)
+        
     def build_controls(self):
-        btns = ttk.LabelFrame(self.main_frame, text="Controls", padding=(8, 6))
-        btns.grid(row=Row+4, column=0, sticky="nsew", padx=0, pady=0)
+        btns = ttk.LabelFrame(self.main_tab, text="Controls", padding=(8, 6))
+        btns.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
         for c in range(3): btns.columnconfigure(c, weight=1)
 
         self.start_btn = ttk.Button(btns, text="Init", command=self.on_init, state="disabled")
@@ -532,8 +1090,8 @@ class Mini_GUI(tk.Tk):
         self.exit_btn.grid(row=2, column=2, padx=2, pady=2, sticky="ew")
 
     def build_inputs(self):
-        inputs = ttk.LabelFrame(self.main_frame, text="Inputs", padding=(8, 6))
-        inputs.grid(row=Row+4, column=1, sticky="nsew", padx=0, pady=0)
+        inputs = ttk.LabelFrame(self.main_tab, text="Inputs", padding=(8, 6))
+        inputs.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
         for c in range(7): inputs.columnconfigure(c, weight=0)
         inputs.columnconfigure(6, weight=1)
 
@@ -572,8 +1130,8 @@ class Mini_GUI(tk.Tk):
         ]
 
     def status_bar(self):
-        status = ttk.LabelFrame(self.main_frame, text="Status", padding=(8, 6))
-        status.grid(row=Row + 5, column=0, sticky="nsew", padx=0, pady=0)
+        status = ttk.LabelFrame(self.main_tab, text="Status", padding=(8, 6))
+        status.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
         for c in range(2): status.columnconfigure(c, weight=1)
 
         self.status_var = tk.StringVar(value="Ready")
@@ -597,8 +1155,8 @@ class Mini_GUI(tk.Tk):
         self._row(status, 8, "Connection:", self.conn_var)
 
     def build_log(self):
-        log_frame = ttk.LabelFrame(self.main_frame, text="Log", padding=(8, 6))
-        log_frame.grid(row=Row + 5, column=1, sticky="nsew", padx=0, pady=0)
+        log_frame = ttk.LabelFrame(self.main_tab, text="Log", padding=(8, 6))
+        log_frame.grid(row=1, column=1, sticky="nsew", padx=0, pady=0)
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
@@ -617,8 +1175,12 @@ class Mini_GUI(tk.Tk):
         self.statusbar_msg = tk.StringVar(value="Ready")
         ttk.Label(sb, textvariable=self.statusbar_msg).grid(row=0, column=0, sticky="w")
 
-
-    # -------- small helpers --------
+    
+        
+    ##########################################################################################
+    ##      Placeholder methods for further implementation
+    ##########################################################################################
+        
     def _row(self, parent, r, label, var):
         ttk.Label(parent, text=label).grid(row=r, column=0, sticky="e", padx=(0,6))
         ttk.Label(parent, textvariable=var).grid(row=r, column=1, sticky="w")
@@ -827,13 +1389,10 @@ class Mini_GUI(tk.Tk):
             safe_close_serial()
         except Exception:
             pass
-        try:
-            SCALER.save("continousPhase_stats_live.npz")
-        except Exception:
-            pass
         self.destroy()
+    
+# -------- background RX --------
 
-    # -------- background RX --------
     def _reader_worker(self):
         while True:
             pkt = read_one_packet_blocking(timeout=0.05)
@@ -875,21 +1434,15 @@ class Mini_GUI(tk.Tk):
 
                 # NN feed
                 if RUN_NN:
-                    fv = make_feature_vector(parsed, self.angle_alpha)
-                    SCALER.partial_fit(fv)
-                    fv_std = SCALER.transform(fv)
+                    streaming_data = np.array([
+                        self.accel_x, self.accel_y, self.accel_z,
+                        self.gyro_x,  self.gyro_z, np.radians(self.angle_alpha), np.radians(self.angle_theta)
+                    ]).reshape((1, -1))  # (1,7)
                     with data_lock:
                         global data_in
-                        data_in = stack_data(data_in, fv_std)
+                        pre = Preprocessor50Hz(7,10,5,50)
+                        data_in = pre.step(streaming_data)
                     new_data_available.set()
-
-                    global _last_scaler_save
-                    if time.time() - _last_scaler_save > 10.0:
-                        try:
-                            SCALER.save("continousPhase_stats_live.npz")
-                        except Exception:
-                            pass
-                        _last_scaler_save = time.time()
 
         self.after(10, self.poll_serial_binary)
 
@@ -942,7 +1495,13 @@ class Mini_GUI(tk.Tk):
             except Exception as e:
                 self._log(f"NN worker error: {e}")
 
-if __name__ == "__main__":
-    gui = Mini_GUI()
-    gui.mainloop()
+    
+    
+    
+    
 
+
+if __name__ == "__main__":
+
+    app = Application()
+    app.mainloop()

@@ -102,21 +102,12 @@ public:
     // ===== BNO055 CALIBRATION FUNCTION =====
     void calibrateBNO055() {
         uint8_t sys, gyro, accel, mag;
-
-        while (true) {
-            bno.getCalibration(&sys, &gyro, &accel, &mag);
-            Serial.print("Calib - SYS: "); Serial.print(sys);
-            Serial.print(" | GYRO: "); Serial.print(gyro);
-            Serial.print(" | ACCEL: "); Serial.print(accel);
-            Serial.print(" | MAG: "); Serial.println(mag);
-
-            if (sys == 3 && gyro == 3 && accel == 3 && mag == 3) {
-                Serial.println("BNO055 Fully Calibrated!");
-                break;
-            }
-
-            delay(1000);
-        }
+        bno.getCalibration(&sys, &gyro, &accel, &mag);
+            //Serial.print("Calib - SYS: "); Serial.print(sys);
+            //Serial.print(" | GYRO: "); Serial.print(gyro);
+            //Serial.print(" | ACCEL: "); Serial.print(accel);
+            //Serial.print(" | MAG: "); Serial.println(mag);
+        delay(1000);
     }
     // ===== AS5600 "CALIBRATION" CHECK =====
     void calibrateAS5600() {

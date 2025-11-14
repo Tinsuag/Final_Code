@@ -161,7 +161,7 @@ void updateSensorsFromHardware() {
   // You can replace with actual motor temp if you have it
   // tempVal  = Ankle.getMotorTemperature();
 
-  accelX = _sensors.accelX;
+  accelX = _sensors.accelX;    
   accelY = _sensors.accelY;
   accelZ = _sensors.accelZ;
   gyroX  = _sensors.gyroX;
@@ -175,7 +175,7 @@ void updateSensorsFromHardware() {
   // IMU calibration check
   uint8_t cSys=0, cG=0, cA=0, cM=0;
   bno.getCalibration(&cSys, &cG, &cA, &cM);
-  cSys_level = cSys; cG_level = cG; cA_level = cA; cM_level = cM;   // keep latest levels
+  cSys_level = cSys; cG_level = cG; cA_level = cA; cM_level = cM;   // keep latest levels in globals variable type uint8_t
   imuFully = (cSys==3 && cG==3 && cA==3 && cM==3) ? 1 : 0;
 
   // Encoder health flag from your class
@@ -225,10 +225,10 @@ void sendStatusToPC() {
   uint8_t payload[128];
   uint8_t p = 0;
 
-  // state code
+  // state code at 
   payload[p++] = currentStateCode;
 
-  // number of floats
+  // number of floats at 
   payload[p++] = NUM_FLOATS;
 
   // helper to write float32 LE
@@ -328,7 +328,9 @@ void applyCommandFromPC(
     Ankle.begin();
 
     if (!bno.begin()) {
-      // could set an IMU error flag here if you want
+      // IMU init failed
+      while (1);
+      Serial.println("BNO055 not detected");
     }
     bno.setExtCrystalUse(true);
 
@@ -346,8 +348,20 @@ void applyCommandFromPC(
   if (requestedState == CALIBRATE_SENSORS) {
     // Your calibration routine for encoder, etc.
     // Keep streaming telemetry in this state so the PC can show progress.
-    _sensors.calibrateAS5600();       // kick any encoder-specific routine (non-blocking if possible)
-    currentState = CALIBRATE_SENSORS; // <-- stay in calibration mode
+    while (1)
+    {
+      _sensors.calibrateAS5600();
+      _sensors.calibrateBNO055();
+      updateSensorsFromHardware();
+
+      if (AUTO_EXIT_WHEN_FULLY_CAL && imuFully && encOK) {
+        break; // exit calibration loop
+      }
+      currentState = CALIBRATE_SENSORS;
+
+    }
+    
+    currentState = IDLE; 
     return;
   }
 
@@ -360,10 +374,6 @@ void applyCommandFromPC(
   }
 
   if (requestedState == IDLE) {
-    // Motor idle / stop
-    //Ankle.torqueClosedLoopCommand(0);
-    //Ankle.motorStopCommand();
-    //targetTorque = 0;
     currentState = IDLE;
     return;
   }
@@ -471,7 +481,7 @@ void handleSerialInput() {
         for (uint8_t i = 0; i < rxLen; i++) {
           calc += rxBuf[i];
         }
-        uint8_t calcChecksum = (uint8_t)(calc % 256);
+        uint8_t calcChecksum = (uint8_t)(calc % 256); // we devide the sum by 256 and keep the remainder 
 
         if (calcChecksum == receivedChecksum) {
           // valid frame -> decode

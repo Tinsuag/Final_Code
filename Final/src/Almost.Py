@@ -889,6 +889,7 @@ class TorqueGUI(ttk.Frame):
                     tau_now = self.model.tau(float(gp_now), alpha_enc_rad)
                 except Exception:
                     tau_now = 0.0
+                
 
                 self.torque_buf.append(tau_now)
 

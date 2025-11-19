@@ -1,6 +1,6 @@
 #include "IMU_Sensors.h"
 #include "RMDX8.h"
-#include <Wire.h>
+
 
 // =================== Hardware Objects ===================
 RMDX8Motor Ankle(53);        // motor driver object (uses SPI CS pin 53)
@@ -153,7 +153,7 @@ void updateSensorsFromHardware() {
   angleTheta = _sensors.AS5600_angle;
 
   // Pitch (deg) from IMU
-  angleAlpha = _sensors.pitch;
+  angleAlpha = _sensors.roll;
 
   // Use gyroX as joint angular velocity proxy
   speedVal   = _sensors.gyroX;
@@ -348,20 +348,8 @@ void applyCommandFromPC(
   if (requestedState == CALIBRATE_SENSORS) {
     // Your calibration routine for encoder, etc.
     // Keep streaming telemetry in this state so the PC can show progress.
-    while (1)
-    {
-      _sensors.calibrateAS5600();
-      _sensors.calibrateBNO055();
-      updateSensorsFromHardware();
-
-      if (AUTO_EXIT_WHEN_FULLY_CAL && imuFully && encOK) {
-        break; // exit calibration loop
-      }
-      currentState = CALIBRATE_SENSORS;
-
-    }
     
-    currentState = IDLE; 
+    currentState = CALIBRATE_SENSORS; 
     return;
   }
 
@@ -380,16 +368,17 @@ void applyCommandFromPC(
 
   if (requestedState == CONTROL) {
 
-    Ankle.targetTorque = (int16_t)(torqueReq);
+      // Store requested values
+    targetTorque       = (int16_t)(torqueReq);           // <-- update global
+    Ankle.targetTorque = targetTorque;
     Ankle.torqueClosedLoopCommand(Ankle.targetTorque);
-    
-    Ankle.targetSpeed = (int32_t)(speedReq * 100 * (float)requestedDir);
-    Ankle.sendSpeedCommand();
-    
 
-      // after movement, fall back to IDLE for safety
-      currentState = IDLE;
-  
+    // Speed (if used together with torque)
+    Ankle.targetSpeed = (int32_t)(speedReq * 100.0f * (float)requestedDir);
+    Ankle.sendSpeedCommand();
+
+    // After movement, fall back to IDLE for safety
+    currentState = IDLE;
     return;
   }
 
@@ -547,13 +536,25 @@ void runStateMachine() {
       break;
 
     case CALIBRATE_SENSORS: {
-      // Stream calibration status. Optionally auto-exit when fully calibrated.
-      const bool imu_full = (cSys_level==3 && cG_level==3 && cA_level==3 && cM_level==3);
+      // Run calibration routines (can be non-blocking internally)
+      _sensors.calibrateAS5600();
+      _sensors.calibrateBNO055();
+
+      // We already call updateSensorsFromHardware() in loop()
+      // so calibration levels (cSys_level, cG_level, etc.) get refreshed.
+      updateSensorsFromHardware();
+      sendStatusToPC();
+
+      const bool imu_full = (cSys_level == 3 && cG_level == 3 && cA_level == 3 && cM_level == 3);
       const bool as_ok    = (getAS5600CalFlag() == 1);
+
+      
+
       if (AUTO_EXIT_WHEN_FULLY_CAL && imu_full && as_ok) {
         currentState = IDLE;
       }
-    } break;
+    }break;
+
 
     case EMERGENCY_STOP:
       // handled in applyCommandFromPC()

@@ -4,6 +4,7 @@
 #include <SPI.h>
 #include <mcp2515.h>
 #include <Arduino.h>
+#include <Wire.h>
 
 class RMDX8Motor {
 public:

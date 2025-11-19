@@ -23,7 +23,7 @@ public:
         gearRatio = 6;
         desiredSpeed = 180; // convert to dps * 100
         targetSpeed = desiredSpeed * gearRatio *100; // convert to dps * 100
-        targetTorque = 30;
+        targetTorque = 0;
         torque = 0;
         position_deg100 = 0; // Initialize position
     }
@@ -34,7 +34,7 @@ public:
         mcp2515.reset();
         mcp2515.setBitrate(CAN_1000KBPS, MCP_8MHZ);
         mcp2515.setNormalMode();
-        Serial.println("MCP2515 Initialized");
+        //Serial.println("MCP2515 Initialized");
     }
 
     // ====== SPEED COMMAND ======
@@ -52,7 +52,7 @@ public:
         msg.data[7] = (uint8_t)((targetSpeed >> 24) & 0xFF);
 
         mcp2515.sendMessage(&msg);
-        Serial.println("Sent speed command.");
+        //Serial.println("Sent speed command.");
     }
 
     // ====== READ STATUS ======
@@ -77,15 +77,15 @@ public:
                 float torque_A = (torque_raw * 33.0) / 2048.0;
                 float angle_deg = encoder_counts * 360.0 / 65535.0;
 
-                Serial.println("---- Motor Status ----");
-                Serial.print("Temperature: "); Serial.println(temperature);
-                Serial.print("Torque Current (A): "); Serial.println(torque_A, 2);
-                Serial.print("Speed (deg/sec): "); Serial.println(speed_dps / gearRatio);
-                Serial.print("Angle (degrees): "); Serial.println(angle_deg, 2);
-                Serial.println("-----------------------");
+                //Serial.println("---- Motor Status ----");
+                //Serial.print("Temperature: "); Serial.println(temperature);
+                //Serial.print("Torque Current (A): "); Serial.println(torque_A, 2);
+                //Serial.print("Speed (deg/sec): "); Serial.println(speed_dps / gearRatio);
+                //Serial.print("Angle (degrees): "); Serial.println(angle_deg, 2);
+                //Serial.println("-----------------------");
             }
         } else {
-            Serial.println("No response received");
+            //Serial.println("No response received");
         }
 
         //delay(500);
@@ -121,12 +121,12 @@ public:
                 float torque_A = (torque_raw * 33.0) / 2048.0;
                 float angle_deg = encoder_counts * 360.0 / 65535.0;
 
-                Serial.println("---- Motor Status ----");
-                Serial.print("Temperature: "); Serial.println(temperature);
-                Serial.print("Torque Current (A): "); Serial.println(torque_A, 2);
-                Serial.print("Speed (deg/sec): "); Serial.println(speed_dps / gearRatio);
-                Serial.print("Angle (degrees): "); Serial.println(angle_deg, 2);
-                Serial.println("-----------------------");
+                //Serial.println("---- Motor Status ----");
+                //Serial.print("Temperature: "); Serial.println(temperature);
+                //Serial.print("Torque Current (A): "); Serial.println(torque_A, 2);
+                //Serial.print("Speed (deg/sec): "); Serial.println(speed_dps / gearRatio);
+                //Serial.print("Angle (degrees): "); Serial.println(angle_deg, 2);
+                //Serial.println("-----------------------");
             }
         } else {
             //Serial.println("No response received");
@@ -157,7 +157,7 @@ public:
         for (int i = 1; i < 8; i++) msg.data[i] = 0x00;
 
         mcp2515.sendMessage(&msg);
-        Serial.println("Read PID command sent.");
+        //Serial.println("Read PID command sent.");
 
         delay(10);
 
@@ -168,16 +168,16 @@ public:
                 uint8_t Ki = response.data[2];
                 uint8_t Kd = response.data[3];
 
-                Serial.println("---- PID Data ----");
-                Serial.print("Kp: "); Serial.println(Kp);
-                Serial.print("Ki: "); Serial.println(Ki);
-                Serial.print("Kd: "); Serial.println(Kd);
-                Serial.println("------------------");
+                //.Serial.println("---- PID Data ----");
+                //Serial.print("Kp: "); Serial.println(Kp);
+                //Serial.print("Ki: "); Serial.println(Ki);
+                //Serial.print("Kd: "); Serial.println(Kd);
+                //Serial.println("------------------");
             } else {
-                Serial.println("Unexpected PID response");
+                //Serial.println("Unexpected PID response");
             }
         } else {
-            Serial.println("No PID response received");
+            //Serial.println("No PID response received");
         }
 
         delay(500);
@@ -215,7 +215,7 @@ private:
         mcp2515.sendMessage(&msg);
 
         Serial.print(description);
-        Serial.println(" command sent.");
+        //Serial.println(" command sent.");
         delay(500);
     }
 };

@@ -1,5 +1,6 @@
 #include "IMU_Sensors.h"
 #include "RMDX8.h"
+#include <Wire.h>
 
 
 // =================== Hardware Objects ===================
@@ -282,6 +283,12 @@ void sendStatusToPC() {
 // =================== APPLY COMMAND FROM PC ===================
 // NOTE: no more safe_flag here.
 // We trust the PC GUI to only send CONTROL if "safety" is enabled.
+// =================== APPLY COMMAND FROM PC (PATCHED) ===================
+//
+// CONTROL  = pure torque mode (no speed command here)
+// SPEED    = pure speed mode (no torque command here)
+// Other states unchanged.
+//
 void applyCommandFromPC(
   uint8_t cmd_id,
   float   torqueReq,
@@ -291,25 +298,24 @@ void applyCommandFromPC(
   // log last request
   requestedTorqueF = torqueReq;
   requestedSpeedF  = speedReq;
-  requestedDir     = (dirFlag == 0) ? -1 : +1;
+  requestedDir     = (dirFlag == 0) ? -1 : +1;   // 0 = reverse, 1 = forward
 
-  // Which state did the PC ask for?
+  // Map cmd_id -> requestedState
   State requestedState = currentState;
   switch (cmd_id) {
-    case CMD_IDLE:         requestedState = IDLE; break;
-    case CMD_INITIALIZING: requestedState = INITIALIZING; break;
+    case CMD_IDLE:         requestedState = IDLE;              break;
+    case CMD_INITIALIZING: requestedState = INITIALIZING;      break;
     case CMD_CALIBRATE:    requestedState = CALIBRATE_SENSORS; break;
-    case CMD_READING:      requestedState = READING; break;
-    case CMD_OFFSETTING:   requestedState = OFFSETTING; break;
-    case CMD_CONTROL:      requestedState = CONTROL; break;
-    case CMD_STOP:         requestedState = EMERGENCY_STOP; break;
-    case CMD_SPEED:        requestedState = SPEED; break;
-    default:               requestedState = IDLE; break;
+    case CMD_READING:      requestedState = READING;           break;
+    case CMD_OFFSETTING:   requestedState = OFFSETTING;        break;
+    case CMD_CONTROL:      requestedState = CONTROL;           break;
+    case CMD_STOP:         requestedState = EMERGENCY_STOP;    break;
+    case CMD_SPEED:        requestedState = SPEED;             break;
+    default:               requestedState = IDLE;              break;
   }
 
-  // Take action:
+  // -------- EMERGENCY STOP (one-shot hard kill) --------
   if (requestedState == EMERGENCY_STOP) {
-    // Hard kill
     Ankle.torqueClosedLoopCommand(0);
     Ankle.motorStopCommand();
     targetTorque = 0;
@@ -317,20 +323,21 @@ void applyCommandFromPC(
     return;
   }
 
-
+  // -------- INITIALIZING (hardware bring-up) --------
   if (requestedState == INITIALIZING) {
     init_Status = 1.0;
 
     Wire.begin();
-    // (optional) faster I2C if supported:
-    Wire.setClock(400000); // 400kHz fast mode I2C, safe for BNO055 + AS5600 on short wires
+    Wire.setClock(400000); // 400kHz I2C for BNO055 + AS5600
 
     Ankle.begin();
 
     if (!bno.begin()) {
-      // IMU init failed
-      while (1);
-      Serial.println("BNO055 not detected");
+      // IMU init failed; you may want to print or blink here
+      // Serial.println("BNO055 not detected");
+      while (1) {
+        // trap if you prefer
+      }
     }
     bno.setExtCrystalUse(true);
 
@@ -338,61 +345,75 @@ void applyCommandFromPC(
     return;
   }
 
+  // -------- OFFSETTING (zero AS5600) --------
   if (requestedState == OFFSETTING) {
-    // Offsetting / zero encoder
     _sensors.offSetting_AS5600();
     currentState = IDLE;
     return;
   }
 
+  // -------- CALIBRATE SENSORS --------
   if (requestedState == CALIBRATE_SENSORS) {
-    // Your calibration routine for encoder, etc.
-    // Keep streaming telemetry in this state so the PC can show progress.
-    
-    currentState = CALIBRATE_SENSORS; 
+    // PC will keep you in this state while calibration is ongoing.
+    // runStateMachine() will do the work & send telemetry.
+    currentState = CALIBRATE_SENSORS;
     return;
   }
 
+  // -------- READING (one-shot sensor refresh) --------
   if (requestedState == READING) {
-    // Just force an update read
     _sensors.readIMUData();
     _sensors.readAS5600Angle();
     currentState = IDLE;
     return;
   }
 
+  // -------- IDLE --------
   if (requestedState == IDLE) {
+    // No active motion command; motor can be commanded zero torque here if you want:
+    // Ankle.torqueClosedLoopCommand(0);
     currentState = IDLE;
     return;
   }
 
+  // -------- CONTROL = PURE TORQUE MODE --------
   if (requestedState == CONTROL) {
+    // map float torqueReq (from PC) to int16_t for motor
+    int16_t tau_cmd = (int16_t)(torqueReq);
 
-      // Store requested values
-    targetTorque       = (int16_t)(torqueReq);           // <-- update global
+    // apply direction: dirFlag = 0 -> reverse, 1 -> forward
+    if (requestedDir == -1) {
+      tau_cmd = -tau_cmd;
+    }
+
+    targetTorque       = tau_cmd;       // for telemetry
     Ankle.targetTorque = targetTorque;
+
+    // PURE torque mode: no speed command here
     Ankle.torqueClosedLoopCommand(Ankle.targetTorque);
 
-    // Speed (if used together with torque)
-    Ankle.targetSpeed = (int32_t)(speedReq * 100.0f * (float)requestedDir);
+    // stay in CONTROL so GUI sees we are in torque mode
+    currentState = CONTROL;
+    return;
+  }
+
+  // -------- SPEED = PURE SPEED MODE --------
+  if (requestedState == SPEED) {
+    // signed speed in whatever units your RMDX8 library expects
+    float signedSpeedCmd = speedReq * (float)requestedDir;
+
+    // if your motor expects e.g. deg/s * 100, scale here:
+    Ankle.targetSpeed = (int32_t)(signedSpeedCmd);
+
+    // call your library's speed command (already using it)
     Ankle.sendSpeedCommand();
 
-    // After movement, fall back to IDLE for safety
-    currentState = IDLE;
+    // you can either stay in SPEED or go back to IDLE after one-shot
+    currentState = SPEED;    // or IDLE; pick what you prefer
     return;
   }
 
-  if (requestedState == SPEED) {
-    // Speed control mode
-    float signedSpeedCmd = speedReq * (float)requestedDir;
-    applySpeedCommand(signedSpeedCmd);
-
-    // after movement, fall back to IDLE for safety
-    currentState = IDLE;
-    return;
-  }
-
-  // default
+  // -------- default --------
   currentState = IDLE;
 }
 

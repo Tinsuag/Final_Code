@@ -525,7 +525,8 @@ class TorqueGUI(ttk.Frame):
 
         grp_core, core_body = collapsible(self.params_inner, "Core Controls")
         grp_core.pack(fill=tk.X)
-        self.gp_percent = add_slider(core_body, "GP (%)", 0, 100, 50, self.update_static_plots, "%")
+        # GP slider removed from UI: keep only an internal variable so presets/load/save still work
+        self.gp_percent = tk.DoubleVar(value=50.0)
         self.alpha_deg  = add_slider(core_body, "α (deg)", -30, 30, 0, self.update_static_plots, "°")
         self.bw_gain    = add_slider(core_body, "BW gain", 0, 2.5, 1, self._update_model)
 
@@ -575,8 +576,8 @@ class TorqueGUI(ttk.Frame):
         self.canvas_imu = FigureCanvasTkAgg(self.fig_imu, master=plot)
         self.canvas_imu.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
-        # Buffers for streaming (10 s window)
-        self.window_sec, self.fs = 10, 50
+        # Buffers for streaming (4 s window)
+        self.window_sec, self.fs = 4, 50
         self.dt, self.max_samples = 1 / self.fs, int(self.window_sec * self.fs)
         self.tbuf = deque(maxlen=self.max_samples)
         self.accX = deque(maxlen=self.max_samples)
@@ -637,7 +638,7 @@ class TorqueGUI(ttk.Frame):
         self.ax_angle.set_ylabel("deg")
         self.ax_angle.set_xlabel("Time [s]")
         self.ax_angle.set_xlim(0, self.window_sec)
-        self.ax_angle.set_ylim(-360, 360)
+        self.ax_angle.set_ylim(-60, 60)
         self.ax_angle.grid(True, alpha=0.25)
         self.ax_angle.legend(loc="upper right", fontsize=8)
 
@@ -834,10 +835,8 @@ class TorqueGUI(ttk.Frame):
 
         # α used to draw the curve:
         if live_gp is not None and live_alpha is not None:
-            gp_for_curve = float(live_gp)
             alpha_for_curve = math.radians(float(live_alpha))
         else:
-            gp_for_curve = float(self.gp_percent.get()) / 100.0
             alpha_for_curve = np.deg2rad(float(self.alpha_deg.get()))
 
         tau = self.model.tau(GP, alpha_for_curve)
@@ -903,13 +902,13 @@ class TorqueGUI(ttk.Frame):
 
         self.ax_tau.legend(loc="upper left", fontsize=8)
 
-        # Phase bar: show live GP if available, otherwise slider GP
+        # Phase bar: show live GP if available, otherwise 0 (no manual input)
         self.ax_phase.clear()
         self.ax_phase.plot([0, 100], [0.5, 0.5], lw=2)
         if live_gp is not None:
             phase_x = float(live_gp) * 100.0
         else:
-            phase_x = float(self.gp_percent.get())
+            phase_x = 0.0
         self.ax_phase.scatter([phase_x], [0.5], s=60, zorder=5)
         self.ax_phase.set_xlim(0, 100)
         self.ax_phase.get_yaxis().set_visible(False)
@@ -921,7 +920,7 @@ class TorqueGUI(ttk.Frame):
             gp_display = float(live_gp) * 100.0
             alpha_display = float(live_alpha)
         else:
-            gp_display = float(self.gp_percent.get())
+            gp_display = 0.0
             alpha_display = float(self.alpha_deg.get())
 
         self.status.config(
@@ -1054,6 +1053,23 @@ class TorqueGUI(ttk.Frame):
         self.line_theta.set_data(x, th_vals)
         self.line_alphaZ.set_data(x, az_vals)
         self.line_alpha_enc.set_data(x, aenc_vals)
+
+        # Dynamic y-limits for angles, allowing up to ±360°
+        all_angles = np.concatenate([th_vals, az_vals, aenc_vals])
+        finite_angles = all_angles[np.isfinite(all_angles)]
+        if finite_angles.size > 0:
+            amin = finite_angles.min()
+            amax = finite_angles.max()
+            # Clamp within [-360, 360]
+            amin = max(-360.0, amin)
+            amax = min(360.0, amax)
+            if abs(amax - amin) < 1e-3:
+                amin -= 5.0
+                amax += 5.0
+            margin = 0.05 * (amax - amin)
+            self.ax_angle.set_ylim(amin - margin, amax + margin)
+        else:
+            self.ax_angle.set_ylim(-60, 60)
 
         # X limit stays fixed [0, window_sec]; we only slide data visually
         self.ax_nn.set_xlim(0, self.window_sec)
@@ -1613,6 +1629,7 @@ class Application(tk.Tk):
         global RUN_NN, USE_FILTER
         USE_FILTER = True
         RUN_NN = True
+        self.status_bar.config(text="CONTROL mode")
         self.status_var.set("CONTROL mode")
 
     def on_stop(self):
@@ -1622,7 +1639,6 @@ class Application(tk.Tk):
         global RUN_NN, USE_FILTER
         RUN_NN = False
         USE_FILTER = False
-        
 
     def on_zero(self):
         self.desired_cmd_id = CMD_OFFSETTING

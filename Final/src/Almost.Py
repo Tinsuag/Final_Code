@@ -353,7 +353,11 @@ def optimized_predict(model, input_data):
 
 
 def GP_estimation(sin_val, cos_val):
-    gp = (1.0 / (2.0 * np.pi)) * (np.arctan2(sin_val, cos_val) + np.pi)
+    global GP_GLOBAL
+    # raw phase in [0, 2π) mapped to [0,1]
+    gp_raw = (1.0 / (2.0 * np.pi)) * (np.arctan2(sin_val, cos_val) + np.pi)
+    gp = float(np.clip(gp_raw, 0.0, 1.0)) # ensure in [0, 1] range 
+    GP_GLOBAL = gp
     return float(np.clip(gp, 0.0, 1.0)) # ensure in [0, 1] range
 
 
@@ -371,12 +375,12 @@ class AssistiveTorque:
         self.alpha1 = np.deg2rad(alpha1_deg)
         self.K_rep = K_rep
         self.BW_gain = BW_gain
+        global GP_GLOBAL
 
-    def f(self, GP): return np.exp(-((GP - self.mu) ** 2) / (2 * self.sigma ** 2))
-    def s(self, GP): return (self.p + 1) / (np.exp((GP - self.c) / self.d) + 1) - self.p
+    def f(self, GP_GLOBAL): return np.exp(-((GP_GLOBAL - self.mu) ** 2) / (2 * self.sigma ** 2))
+    def s(self, GP_GLOBAL): return (self.p + 1) / (np.exp((GP_GLOBAL - self.c) / self.d) + 1) - self.p
     def r(self, alpha): return 1 + self.K_rep * (np.exp(self.alpha0 - alpha) + np.exp(alpha - self.alpha1))
-    def tau(self, GP, alpha): return self.BW_gain * self.f(GP) * self.s(GP) / self.r(alpha)
-
+    def tau(self, GP_GLOBAL, alpha): return self.BW_gain * self.f(GP_GLOBAL) * self.s(GP_GLOBAL) / self.r(alpha)
 
 class TorqueGUI(ttk.Frame):
     def __init__(self, master):
@@ -397,9 +401,9 @@ class TorqueGUI(ttk.Frame):
         toolbar.pack(fill=tk.X, side=tk.TOP)
 
         self.presets = {
-            "Default": dict(gp=50, alpha=0, bw=1, mu=0.5, sigma=0.17, c=0.6, d=0.02, p=0.8, a0=-10, a1=10, krep=1),
-            "Heel-Strike Assist": dict(gp=5, alpha=-5, bw=1.2, mu=0.1, sigma=0.12, c=0.18, d=0.02, p=0.6, a0=-12, a1=8, krep=1.2),
-            "Push-Off Boost": dict(gp=60, alpha=6, bw=1.5, mu=0.6, sigma=0.14, c=0.55, d=0.02, p=0.9, a0=-8, a1=12, krep=0.8),
+            "Default": dict(gp=GP_GLOBAL, alpha=0, bw=1, mu=0.5, sigma=0.17, c=0.6, d=0.02, p=0.8, a0=-10, a1=10, krep=1),
+        "Heel-Strike Assist": dict(gp=GP_GLOBAL, alpha=-5, bw=1.2, mu=0.1, sigma=0.12, c=0.18, d=0.02, p=0.6, a0=-12, a1=8, krep=1.2),
+            "Push-Off Boost": dict(gp=GP_GLOBAL, alpha=6, bw=1.5, mu=0.6, sigma=0.14, c=0.55, d=0.02, p=0.9, a0=-8, a1=12, krep=0.8),
         }
         preset_box = ttk.Frame(toolbar)
         preset_box.pack(side=tk.LEFT, padx=(12, 6))
@@ -411,13 +415,9 @@ class TorqueGUI(ttk.Frame):
 
         btns = ttk.Frame(toolbar)
         btns.pack(side=tk.RIGHT)
-        self.play_btn = ttk.Button(btns, text="⏸ Pause IMU", command=self.toggle_stream)
+        self.play_btn = ttk.Button(btns, text="▶ Start readings", command=self.toggle_stream)
         self.play_btn.pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="⟳ Reset", command=self.reset_params).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="⬇ Save Figures", command=self.save_figs).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="💾 Save Params", command=self.save_params).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="📂 Load Params", command=self.load_params).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="📌 Freeze τ", command=self.freeze_curve).pack(side=tk.LEFT, padx=4)
 
         splitter = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         splitter.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
@@ -632,12 +632,12 @@ class TorqueGUI(ttk.Frame):
     # ---------------- Toolbar actions ----------------
     def toggle_stream(self):
         self.streaming = not self.streaming
-        self.play_btn.config(text="▶ Resume IMU" if not self.streaming else "⏸ Pause IMU")
-        self._log2("IMU streaming: " + ("PAUSED" if not self.streaming else "RESUMED"))
+        self.play_btn.config(text="▶ Resume readings" if not self.streaming else "⏸ Pause readings")
+        self._log2("Sensors streaming: " + ("PAUSED" if not self.streaming else "RESUMED"))
 
     def reset_params(self):
         for s, val in [
-            (self.gp_percent, 50), (self.alpha_deg, 0), (self.bw_gain, 1),
+            (self.gp_percent, GP_GLOBAL), (self.alpha_deg, 0), (self.bw_gain, 1),
             (self.mu, 0.5), (self.sigma, 0.17),
             (self.c, 0.6), (self.d, 0.02), (self.p, 0.8),
             (self.a0, -10), (self.a1, 10), (self.krep, 1),
@@ -646,61 +646,7 @@ class TorqueGUI(ttk.Frame):
         self.prev_tau = None
         self._update_model()
         self._log2("Parameters reset to defaults.")
-
-    def save_figs(self):
-        try:
-            path = filedialog.asksaveasfilename(
-                title="Save main figure as...",
-                defaultextension=".png",
-                filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")]
-            )
-            if not path:
-                return
-            self.fig.savefig(path, dpi=150, bbox_inches="tight")
-            base, ext = path.rsplit(".", 1)
-            imu_path = f"{base}_imu.{ext}"
-            self.fig_imu.savefig(imu_path, dpi=150, bbox_inches="tight")
-            messagebox.showinfo("Saved", f"Figures saved:\n• {path}\n• {imu_path}")
-            self._log2(f"Saved figures to {path} and {imu_path}")
-        except Exception as e:
-            messagebox.showerror("Save error", str(e))
-            self._log2(f"Save error: {e}")
-
-    def save_params(self):
-        m = self._get_sliders()
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
-        if not path:
-            self._log2("Save params canceled.")
-            return
-        try:
-            with open(path, "w") as f:
-                json.dump(m, f, indent=2)
-            self._log2(f"Parameters saved: {path}")
-        except Exception as e:
-            messagebox.showerror("Save Params Error", str(e))
-            self._log2(f"Save params error: {e}")
-
-    def load_params(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if not path:
-            self._log2("Load params canceled.")
-            return
-        try:
-            with open(path) as f:
-                m = json.load(f)
-            self._set_sliders(m)
-            self._log2(f"Parameters loaded: {path}")
-        except Exception as e:
-            messagebox.showerror("Load Params Error", str(e))
-            self._log2(f"Load params error: {e}")
-
-    def freeze_curve(self):
-        GP = np.linspace(0, 1, 600)
-        alpha = np.deg2rad(float(self.alpha_deg.get()))
-        self.prev_tau = (GP, self.model.tau(GP, alpha))
-        self.update_static_plots()
-        self._log2("Current τ curve frozen for comparison.")
-
+         
     def apply_preset(self):
         name = self.preset_var.get()
         self._set_sliders(self.presets[name])

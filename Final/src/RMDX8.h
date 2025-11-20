@@ -21,7 +21,7 @@ public:
         : mcp2515(csPin)
     {
         gearRatio = 6;
-        desiredSpeed = 180; // convert to dps * 100
+        desiredSpeed = 0; // convert to dps * 100
         targetSpeed = desiredSpeed * gearRatio *100; // convert to dps * 100
         targetTorque = 0;
         torque = 0;
@@ -108,7 +108,7 @@ public:
         mcp2515.sendMessage(&msg);
         //Serial.println("Torque command sent.");
 
-        //delay(10);
+        delay(10);
         //readMotorStatus();
         struct can_frame response;
         if (mcp2515.readMessage(&response) == MCP2515::ERROR_OK) {

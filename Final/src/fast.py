@@ -11,6 +11,9 @@ from PIL import Image, ImageTk
 import matplotlib
 import json
 import keras
+import tensorflow as tf
+
+from scipy.signal import butter, lfilter, lfilter_zi
 
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
@@ -47,6 +50,8 @@ except Exception:
 # ======================
 DEFAULT_PORT = "COM4"
 DEFAULT_BAUD = 115200
+
+
 
 # ======================
 # COMMAND IDs (sync with Arduino)
@@ -103,53 +108,90 @@ cM_level = 0
 # ======================
 LOG2_FUNC = None
 
+@tf.function # Optimize prediction with TensorFlow's graph execution
+def optimized_predict(model, input_data):
+    return model(input_data, training=False)
 
-class LowPassFilter:
-    def __init__(self, n_features=7, cutoff_hz=5.0, fs=50.0):
-        dt = 1.0 / fs
-        RC = 1.0 / (2.0 * np.pi * cutoff_hz)
-        self.alpha = dt / (RC + dt)
-        self.y = np.zeros(n_features, dtype=float)
+class ButterworthLPF:
+    """
+    Stateful 2nd-order Butterworth low-pass filter applied per feature.
+    cutoff_hz: 5.0
+    fs:       50.0
+    """
+    def __init__(self, n_features=7, cutoff_hz=5.0, fs=50.0, order=2):
+        self.n_features = n_features
+
+        # Normalized cutoff
+        wn = cutoff_hz / (fs / 2.0)
+        self.b, self.a = butter(order, wn, btype="low", analog=False)
+
+        # One zi vector per feature -> shape (order, n_features)
+        zi_1d = lfilter_zi(self.b, self.a)        # shape (order,)
+        self.zi = np.tile(zi_1d[:, None], (1, n_features))
         self.initialized = False
 
     def update(self, x):
-        x = np.asarray(x, dtype=float)
+        """
+        x: shape (7,) – one sample with 7 features
+        returns: filtered sample, shape (7,)
+        """
+        x = np.asarray(x, dtype=float).reshape(1, -1)  # (1, 7)
+
         if not self.initialized:
-            self.y = x.copy()
+            # optional warm start: pretend previous output was equal to first input
             self.initialized = True
-        else:
-            self.y = self.y + self.alpha * (x - self.y)
-        return self.y.copy()
+
+        y, self.zi = lfilter(self.b, self.a, x, axis=0, zi=self.zi)
+        return y[0]  # shape (7,)
 
 
 class Preprocessor50Hz:
+    """
+    Streaming preprocessor (keeps the old name so the rest of the code is unchanged):
+
+    raw 7D sample ->
+        Butterworth 5 Hz LPF ->
+        online z-score standardization ->
+        rolling buffer of last `max_rows` rows (<= 10)
+    """
     def __init__(self, n_features=7, max_rows=10, cutoff_hz=5.0, fs=50.0):
         self.n_features = n_features
         self.max_rows = max_rows
         self.buffer = np.empty((0, n_features), dtype=float)
-        self.lpf = LowPassFilter(n_features=n_features,
-                                 cutoff_hz=cutoff_hz,
-                                 fs=fs)
+
+        self.lpf = ButterworthLPF(
+            n_features=n_features,
+            cutoff_hz=cutoff_hz,
+            fs=fs,
+            order=2,
+        )
 
     def _add_and_stack(self, filtered_sample):
         filtered_sample = np.asarray(filtered_sample, dtype=float)
 
+        # Online z-score using the history in self.buffer
         if self.buffer.shape[0] >= 2:
             mean = self.buffer.mean(axis=0)
             std = self.buffer.std(axis=0)
-            std[std == 0.0] = 1.0
+            std[std == 0.0] = 1.0      # avoid divide-by-zero
             std_sample = (filtered_sample - mean) / std
         else:
+            # While we don't have history, just use filtered value
             std_sample = filtered_sample
 
         self.buffer = np.vstack([self.buffer, std_sample])
 
+        # Keep only last max_rows rows
         if self.buffer.shape[0] > self.max_rows:
             self.buffer = self.buffer[-self.max_rows:, :]
 
     def step(self, raw_sample):
+        # 1) Butterworth 5 Hz filter
         filtered = self.lpf.update(raw_sample)
+
+        # 2) Z-score + rolling window
         self._add_and_stack(filtered)
+
         return self.buffer
 
     def get_buffer(self):
@@ -397,21 +439,21 @@ class TorqueGUI(ttk.Frame):
         toolbar.pack(fill=tk.X, side=tk.TOP)
 
         self.presets = {
-            "Default": dict(gp=50, alpha=0, bw=1, mu=0.5, sigma=0.17, c=0.6, d=0.02, p=0.8, a0=-10, a1=10, krep=1),
-            "Heel-Strike Assist": dict(gp=5, alpha=-5, bw=1.2, mu=0.1, sigma=0.12, c=0.18, d=0.02, p=0.6, a0=-12, a1=8, krep=1.2),
-            "Push-Off Boost": dict(gp=60, alpha=6, bw=1.5, mu=0.6, sigma=0.14, c=0.55, d=0.02, p=0.9, a0=-8, a1=12, krep=0.8),
+            "Default": dict( alpha=0, bw=1, mu=0.5, sigma=0.17, c=0.6, d=0.02, p=0.8, a0=-10, a1=10, krep=1),
+            "Heel-Strike Assist": dict(alpha=-5, bw=1.2, mu=0.1, sigma=0.12, c=0.18, d=0.02, p=0.6, a0=-12, a1=8, krep=1.2),
+            "Push-Off Boost": dict(alpha=6, bw=1.5, mu=0.6, sigma=0.14, c=0.55, d=0.02, p=0.9, a0=-8, a1=12, krep=0.8),
         }
         preset_box = ttk.Frame(toolbar)
         preset_box.pack(side=tk.LEFT, padx=(12, 6))
         ttk.Label(preset_box, text="Preset:").pack(side=tk.LEFT)
         self.preset_var = tk.StringVar(value="Default")
         ttk.Combobox(preset_box, width=18, textvariable=self.preset_var,
-                     values=list(self.presets.keys()), state="readonly").pack(side=tk.LEFT, padx=4)
+                     values=list(self.presets.keys()), state="readonly").pack(side=tk.LEFT, padx=4) ## readonly to prevent user edits 
         ttk.Button(preset_box, text="Apply", command=self.apply_preset).pack(side=tk.LEFT)
 
         btns = ttk.Frame(toolbar)
         btns.pack(side=tk.RIGHT)
-        self.play_btn = ttk.Button(btns, text="⏸ Pause IMU", command=self.toggle_stream)
+        self.play_btn = ttk.Button(btns, text="▶ Resume IMU", command=self.toggle_stream)
         self.play_btn.pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="⟳ Reset", command=self.reset_params).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="⬇ Save Figures", command=self.save_figs).pack(side=tk.LEFT, padx=4)
@@ -576,7 +618,7 @@ class TorqueGUI(ttk.Frame):
         self.canvas_imu.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
         # Buffers for streaming (10 s window)
-        self.window_sec, self.fs = 10, 50
+        self.window_sec, self.fs = 4, 100
         self.dt, self.max_samples = 1 / self.fs, int(self.window_sec * self.fs)
         self.tbuf = deque(maxlen=self.max_samples)
         self.accX = deque(maxlen=self.max_samples)
@@ -1089,6 +1131,8 @@ class Application(tk.Tk):
         self.quaternion_y = 0.0
         self.quaternion_z = 0.0
         self.yaw = self.pitch = self.roll = 0.0
+        self.angle_theta_q_ref = 0.0
+        self.angle_alpha_q_ref = 0.0
 
         self.imu_fully = 0
         self.enc_ok    = 1
@@ -1488,8 +1532,8 @@ class Application(tk.Tk):
         self.roll = roll_rad
         self.pitch = pitch_rad
         self.yaw = yaw_rad
-        self.angle_alpha_q = math.degrees(self.yaw)
-        self.angle_theta_q = math.degrees(roll_rad)
+        self.angle_alpha_q = math.degrees(self.yaw) - self.angle_alpha_q_ref
+        self.angle_theta_q = math.degrees(roll_rad) - self.angle_theta_q_ref
         self.angle_theta = self.angle_theta_q
 
     def _connect_clicked(self):
@@ -1627,6 +1671,8 @@ class Application(tk.Tk):
     def on_zero(self):
         self.desired_cmd_id = CMD_OFFSETTING
         self._tx_frame(build_cmd_offsetting(), "TX OFFSETTING (encoder zero)")
+        self.angle_theta_q_ref = self.angle_theta_q
+        self.angle_theta_q_ref = self.angle_theta_q
 
     def on_calibrate(self):
         self.desired_cmd_id = CMD_CALIBRATE
@@ -1803,7 +1849,7 @@ class Application(tk.Tk):
                 LOG2_FUNC(msg)
             self.status_var.set("Calibrated")
 
-        self.after(250, self._update_status)
+        self.after(100, self._update_status)
 
     def _nn_worker(self):
         """
@@ -1812,7 +1858,7 @@ class Application(tk.Tk):
         - If RUN_NN is True, runs the model and updates last_cos_filt / last_sin_filt / last_gp
         - Logs NN status to the main log
         """
-        global response_bytes, current_reply, RUN_NN
+        global RUN_NN
         model = None
 
         while True:
@@ -1857,19 +1903,19 @@ class Application(tk.Tk):
                     window = np.vstack([np.zeros((pad_rows, 7), dtype=np.float32), window])
 
                 # Run NN
-                raw_out = model(window.reshape((1, 10, 7)), training=False).numpy()
-
+                #raw_out = model(window.reshape((1, 10, 7)), training=False).numpy()
+                NN_out = np.array(optimized_predict(model, window.reshape((1, 10, 7))))[0][0]
                 # Handle both possible output shapes:
                 #  - (batch, 2)              -> direct
                 #  - (batch, timesteps, 2)   -> take last timestep
-                if raw_out.ndim == 3:
+                #if raw_out.ndim == 3:
                     # (1, T, 2) -> (1, 2) by taking last time step
-                    raw_out = raw_out[:, -1, :]
-                elif raw_out.ndim != 2:
-                    self._log(f"Unexpected NN output shape: {raw_out.shape}")
-                    continue
+                 #   raw_out = raw_out[:, -1, :]
+                #elif raw_out.ndim != 2:
+                    #self._log(f"Unexpected NN output shape: {raw_out.shape}")
+                    #continue
 
-                NN_out = raw_out[0]  # shape (2,)
+               # NN_out = raw_out[0]  # shape (2,)
                 cos_val = float(NN_out[0])
                 sin_val = float(NN_out[1])
 
@@ -1879,13 +1925,6 @@ class Application(tk.Tk):
                     alpha=ALPHA,
                     enable_filter=USE_FILTER
                 )
-
-                # Pack for Arduino (if needed)
-                cos_i = int(max(-1.0, min(1.0, cos_filt)) * CONVERTER)
-                sin_i = int(max(-1.0, min(1.0, sin_filt)) * CONVERTER)
-                packed = struct.pack('>ii', cos_i, sin_i)
-                response_bytes = packed
-                current_reply  = packed
 
                 # Gait phase
                 gait_phase = GP_estimation(sin_filt, cos_filt)
